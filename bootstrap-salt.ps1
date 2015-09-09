@@ -40,7 +40,7 @@ is dynamically determined by the script.
 Bootstrap GitHub Project (script home) - https://github.com/saltstack/salt-windows-bootstrap
 Original Vagrant Provisioner Project -https://github.com/saltstack/salty-vagrant
 Vagrant Project (utilizes this script) - https://github.com/mitchellh/vagrant
-SaltStack Download Location - http://docs.saltstack.com/downloads/
+SaltStack Download Location - https://repo.saltstack.com/windows/
 #>
 [CmdletBinding()]
 Param(
@@ -102,7 +102,7 @@ If ([IntPtr]::Size -eq 4) {
 # Download minion setup file
 Write-Host -NoNewline "Downloading Salt minion installer Salt-Minion-$version-$arch-Setup.exe"
 $webclient = New-Object System.Net.WebClient
-$url = "https://docs.saltstack.com/downloads/Salt-Minion-$version-$arch-Setup.exe"
+$url = "https://repo.saltstack.com/windows/Salt-Minion-$version-$arch-Setup.exe"
 $file = "C:\tmp\salt.exe"
 $webclient.DownloadFile($url, $file)
 
