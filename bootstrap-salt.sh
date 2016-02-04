@@ -222,6 +222,7 @@ _HTTP_PROXY=""
 _DISABLE_SALT_CHECKS=$BS_FALSE
 __SALT_GIT_CHECKOUT_DIR=${BS_SALT_GIT_CHECKOUT_DIR:-/tmp/git/salt}
 _NO_DEPS=$BS_FALSE
+_FORCE_SHALLOW_CLONE=$BS_FALSE
 
 
 #---  FUNCTION  -------------------------------------------------------------------------------------------------------
@@ -295,12 +296,13 @@ usage() {
   -Z  Enable external software source for newer ZeroMQ(Only available for RHEL/CentOS/Fedora/Ubuntu based distributions)
   -b  Assume that dependencies are already installed and software sources are set up.
       If git is selected, git tree is still checked out as dependency step.
+  -f  Force shallow cloning for git installations. This may result in an "n/a" in the version number.
 
 EOT
 }   # ----------  end of function usage  ----------
 
 
-while getopts ":hvnDc:Gg:k:MSNXCPFUKIA:i:Lp:dH:Zbs:" opt
+while getopts ":hvnDc:Gg:k:MSNXCPFUKIA:i:Lp:dH:Zbsf" opt
 do
   case "${opt}" in
 
@@ -354,6 +356,7 @@ do
     H )  _HTTP_PROXY="$OPTARG"                          ;;
     Z )  _ENABLE_EXTERNAL_ZMQ_REPOS=$BS_TRUE            ;;
     b )  _NO_DEPS=$BS_TRUE                              ;;
+    f )  _FORCE_SHALLOW_CLONE=$BS_TRUE                  ;;
 
 
     \?)  echo
@@ -868,6 +871,10 @@ __gather_linux_system_info() {
                         n="Debian"
                         v=$(__derive_debian_numeric_version "$v")
                         ;;
+                    sles        )
+                        n="SUSE"
+                        v="${rv}"
+                        ;;
                     *           )
                         n=${nn}
                         ;;
@@ -1290,9 +1297,18 @@ __git_clone_and_checkout() {
             git pull --rebase || return 1
         fi
     else
-        __SHALLOW_CLONE="${BS_FALSE}"
-        if [ "$(echo "$GIT_REV" | sed 's/^.*\(v[[:digit:]]\{1,4\}\.[[:digit:]]\{1,2\}\)\(\.[[:digit:]]\{1,2\}\)\?.*$/MATCH/')" = "MATCH" ]; then
-            echoinfo "Git revision matches a Salt version tag"
+        if [ "$_FORCE_SHALLOW_CLONE" -eq "${BS_TRUE}" ]; then
+            echoinfo "Forced shallow cloning of git repository."
+            __SHALLOW_CLONE="${BS_TRUE}"
+        elif [ "$(echo "$GIT_REV" | sed 's/^.*\(v[[:digit:]]\{1,4\}\.[[:digit:]]\{1,2\}\)\(\.[[:digit:]]\{1,2\}\)\?.*$/MATCH/')" = "MATCH" ]; then
+            echoinfo "Git revision matches a Salt version tag, shallow cloning enabled."
+            __SHALLOW_CLONE="${BS_TRUE}"
+        else
+            echowarn "The git revision being installed does not match a Salt version tag. Shallow cloning disabled"
+            __SHALLOW_CLONE="${BS_FALSE}"
+        fi
+
+        if [ "$__SHALLOW_CLONE" -eq "${BS_TRUE}" ]; then
             # Let's try shallow cloning to speed up.
             # Test for "--single-branch" option introduced in git 1.7.10, the minimal version of git where the shallow
             # cloning we need actually works
@@ -1307,30 +1323,27 @@ __git_clone_and_checkout() {
                     # Shallow clone above failed(missing upstream tags???), let's resume the old behaviour.
                     echowarn "Failed to shallow clone."
                     echoinfo "Resuming regular git clone and remote SaltStack repository addition procedure"
-                    git clone "$_SALT_REPO_URL" "$__SALT_CHECKOUT_REPONAME" || return 1
-                    cd "${__SALT_GIT_CHECKOUT_DIR}"
+                    __SHALLOW_CLONE="${BS_FALSE}"
                 fi
             else
                 echodebug "Shallow cloning not possible. Required git version not met."
-                git clone "$_SALT_REPO_URL" "$__SALT_CHECKOUT_REPONAME" || return 1
-                cd "${__SALT_GIT_CHECKOUT_DIR}"
+                __SHALLOW_CLONE="${BS_FALSE}"
             fi
-        else
-            echowarn "The git revision being installed does not match a Salt version tag. Shallow cloning disabled"
-            git clone "$_SALT_REPO_URL" "$__SALT_CHECKOUT_REPONAME" || return 1
-            cd "${__SALT_GIT_CHECKOUT_DIR}"
-        fi
-
-        if [ "$(echo "$_SALT_REPO_URL" | grep -c -e '\(\(git\|https\)://github\.com/\|git@github\.com:\)saltstack/salt\.git')" -eq 0 ]; then
-            # We need to add the saltstack repository as a remote and fetch tags for proper versioning
-            echoinfo "Adding SaltStack's Salt repository as a remote"
-            git remote add upstream "$_SALTSTACK_REPO_URL" || return 1
-            echodebug "Fetching upstream(SaltStack's Salt repository) git tags"
-            git fetch --tags upstream || return 1
-            GIT_REV="origin/$GIT_REV"
         fi
 
         if [ "$__SHALLOW_CLONE" -eq "${BS_FALSE}" ]; then
+            git clone "$_SALT_REPO_URL" "$__SALT_CHECKOUT_REPONAME" || return 1
+            cd "${__SALT_GIT_CHECKOUT_DIR}"
+
+            if [ "$(echo "$_SALT_REPO_URL" | grep -c -e '\(\(git\|https\)://github\.com/\|git@github\.com:\)saltstack/salt\.git')" -eq 0 ]; then
+                # We need to add the saltstack repository as a remote and fetch tags for proper versioning
+                echoinfo "Adding SaltStack's Salt repository as a remote"
+                git remote add upstream "$_SALTSTACK_REPO_URL" || return 1
+                echodebug "Fetching upstream(SaltStack's Salt repository) git tags"
+                git fetch --tags upstream || return 1
+                GIT_REV="origin/$GIT_REV"
+            fi
+
             echodebug "Checking out $GIT_REV"
             git checkout "$GIT_REV" || return 1
         fi
@@ -4496,6 +4509,9 @@ install_opensuse_stable_deps() {
     # shellcheck disable=SC2086
     __zypper_install ${__PACKAGES} || return 1
 
+    # Fix for OpenSUSE 13.2 and 2015.8 - gcc should not be required. Work around until package is fixed by SuSE
+    _EXTRA_PACKAGES="${_EXTRA_PACKAGES} gcc python-devel libgit2-devel" 
+
     if [ "${_EXTRA_PACKAGES}" != "" ]; then
         echoinfo "Installing the following extra packages as requested: ${_EXTRA_PACKAGES}"
         # shellcheck disable=SC2086
@@ -4662,8 +4678,200 @@ install_opensuse_check_services() {
 
 #######################################################################################################################
 #
-#    SuSE Install Functions.
+#   SUSE Enterprise 12
 #
+
+install_suse_12_stable_deps() {
+    SUSE_PATCHLEVEL=$(awk '/PATCHLEVEL/ {print $3}' /etc/SuSE-release )
+
+    if [ "${SUSE_PATCHLEVEL}" != "" ]; then
+        DISTRO_PATCHLEVEL="_SP${SUSE_PATCHLEVEL}"
+    fi
+
+    # SLES 12 repo name does not use a patch level so PATCHLEVEL will need to be updated with SP1
+    #DISTRO_REPO="SLE_${DISTRO_MAJOR_VERSION}${DISTRO_PATCHLEVEL}"
+
+    DISTRO_REPO="SLE_${DISTRO_MAJOR_VERSION}"
+
+    # Is the repository already known
+    __zypper repos | grep devel_languages_python >/dev/null 2>&1
+    if [ $? -eq 1 ]; then
+        # zypper does not yet know nothing about devel_languages_python
+        __zypper addrepo --refresh \
+            "http://download.opensuse.org/repositories/devel:/languages:/python/${DISTRO_REPO}/devel:languages:python.repo" || return 1
+    fi
+
+    __zypper --gpg-auto-import-keys refresh || return 1
+
+    if [ "$_UPGRADE_SYS" -eq $BS_TRUE ]; then
+        __zypper --gpg-auto-import-keys update || return 1
+    fi
+
+    # Salt needs python-zypp installed in order to use the zypper module
+    __PACKAGES="python-zypp"
+    # shellcheck disable=SC2089
+    __PACKAGES="${__PACKAGES} libzmq3 python python-Jinja2 python-msgpack-python"
+    __PACKAGES="${__PACKAGES} python-pycrypto python-pyzmq python-pip python-xml python-requests"
+
+    if [ "$SUSE_PATCHLEVEL" -eq 1 ]; then
+        check_pip_allowed
+        echowarn "PyYaml will be installed using pip"
+    else
+        __PACKAGES="${__PACKAGES} python-PyYAML"
+    fi
+
+    if [ "$_INSTALL_CLOUD" -eq $BS_TRUE ]; then
+        __PACKAGES="${__PACKAGES} python-apache-libcloud"
+    fi
+
+    # SLES 11 SP3 ships with both python-M2Crypto-0.22.* and python-m2crypto-0.21 and we will be asked which
+    # we want to install, even with --non-interactive.
+    # Let's try to install the higher version first and then the lower one in case of failure
+    __zypper_install 'python-M2Crypto>=0.22' || __zypper_install 'python-M2Crypto>=0.21' || return 1
+    # shellcheck disable=SC2086,SC2090
+    __zypper_install ${__PACKAGES} || return 1
+
+    if [ "$SUSE_PATCHLEVEL" -eq 1 ]; then
+        # There's no python-PyYaml in SP1, let's install it using pip
+        pip install PyYaml || return 1
+    fi
+
+    # PIP based installs need to copy configuration files "by hand".
+    if [ "$SUSE_PATCHLEVEL" -eq 1 ]; then
+        # Let's trigger config_salt()
+        if [ "$_TEMP_CONFIG_DIR" = "null" ]; then
+            # Let's set the configuration directory to /tmp
+            _TEMP_CONFIG_DIR="/tmp"
+            CONFIG_SALT_FUNC="config_salt"
+
+            for fname in minion master syndic api; do
+
+                # Skip if not meant to be installed
+                [ $fname = "minion" ] && [ "$_INSTALL_MINION" -eq $BS_FALSE ] && continue
+                [ $fname = "master" ] && [ "$_INSTALL_MASTER" -eq $BS_FALSE ] && continue
+                [ $fname = "api" ] && ([ "$_INSTALL_MASTER" -eq $BS_FALSE ] || [ "$(which salt-${fname} 2>/dev/null)" = "" ]) && continue
+                [ $fname = "syndic" ] && [ "$_INSTALL_SYNDIC" -eq $BS_FALSE ] && continue
+
+                # Syndic uses the same configuration file as the master
+                [ $fname = "syndic" ] && fname=master
+
+                # Let's download, since they were not provided, the default configuration files
+                if [ ! -f "$_SALT_ETC_DIR/$fname" ] && [ ! -f "$_TEMP_CONFIG_DIR/$fname" ]; then
+                    # shellcheck disable=SC2086
+                    curl $_CURL_ARGS -s -o "$_TEMP_CONFIG_DIR/$fname" -L \
+                        "https://raw.githubusercontent.com/saltstack/salt/develop/conf/$fname" || return 1
+                fi
+            done
+        fi
+    fi
+
+    if [ "${_EXTRA_PACKAGES}" != "" ]; then
+        echoinfo "Installing the following extra packages as requested: ${_EXTRA_PACKAGES}"
+        # shellcheck disable=SC2086
+        __zypper_install ${_EXTRA_PACKAGES} || return 1
+    fi
+
+    return 0
+}
+
+install_suse_12_git_deps() {
+    install_suse_11_stable_deps || return 1
+
+    if [ "$(which git)" = "" ]; then
+        __zypper_install git  || return 1
+    fi
+
+    __git_clone_and_checkout || return 1
+
+    if [ -f "${__SALT_GIT_CHECKOUT_DIR}/requirements/base.txt" ]; then
+        # We're on the develop branch, install whichever tornado is on the requirements file
+        __REQUIRED_TORNADO="$(grep tornado "${__SALT_GIT_CHECKOUT_DIR}/requirements/base.txt")"
+        if [ "${__REQUIRED_TORNADO}" != "" ]; then
+            __zypper_install python-tornado
+        fi
+    fi
+
+    # Let's trigger config_salt()
+    if [ "$_TEMP_CONFIG_DIR" = "null" ]; then
+        _TEMP_CONFIG_DIR="${__SALT_GIT_CHECKOUT_DIR}/conf/"
+        CONFIG_SALT_FUNC="config_salt"
+    fi
+
+    return 0
+}
+
+install_suse_12_stable() {
+    if [ "$SUSE_PATCHLEVEL" -gt 1 ]; then
+        install_opensuse_stable || return 1
+    else
+        # USE_SETUPTOOLS=1 To work around
+        # error: option --single-version-externally-managed not recognized
+        USE_SETUPTOOLS=1 pip install salt || return 1
+    fi
+    return 0
+}
+
+install_suse_12_git() {
+    install_opensuse_git || return 1
+    return 0
+}
+
+install_suse_12_stable_post() {
+    if [ "$SUSE_PATCHLEVEL" -gt 1 ]; then
+        install_opensuse_stable_post || return 1
+    else
+        for fname in minion master syndic api; do
+
+            # Skip if not meant to be installed
+            [ $fname = "minion" ] && [ "$_INSTALL_MINION" -eq $BS_FALSE ] && continue
+            [ $fname = "master" ] && [ "$_INSTALL_MASTER" -eq $BS_FALSE ] && continue
+            [ $fname = "api" ] && ([ "$_INSTALL_MASTER" -eq $BS_FALSE ] || [ "$(which salt-${fname} 2>/dev/null)" = "" ]) && continue
+            [ $fname = "syndic" ] && [ "$_INSTALL_SYNDIC" -eq $BS_FALSE ] && continue
+
+            if [ -f /bin/systemctl ]; then
+                # shellcheck disable=SC2086
+                curl $_CURL_ARGS -L "https://github.com/saltstack/salt/raw/develop/pkg/salt-$fname.service" \
+                    -o "/usr/lib/systemd/system/salt-$fname.service" || return 1
+                continue
+            fi
+
+            ## shellcheck disable=SC2086
+            #curl $_CURL_ARGS -L "https://github.com/saltstack/salt/raw/develop/pkg/rpm/salt-$fname" \
+            #    -o "/etc/init.d/salt-$fname" || return 1
+            #chmod +x "/etc/init.d/salt-$fname"
+
+            if [ -f /bin/systemctl ]; then
+                systemctl is-enabled salt-$fname.service || (systemctl preset salt-$fname.service && systemctl enable salt-$fname.service)
+                sleep 0.1
+                systemctl daemon-reload
+                continue
+            fi
+
+        done
+    fi
+    return 0
+}
+
+install_suse_12_git_post() {
+    install_opensuse_git_post || return 1
+    return 0
+}
+
+install_suse_12_restart_daemons() {
+    install_opensuse_restart_daemons || return 1
+    return 0
+}
+
+#
+#   End of SUSE Enterprise 12
+#
+#######################################################################################################################
+
+#######################################################################################################################
+#
+#   SUSE Enterprise 11
+#
+
 install_suse_11_stable_deps() {
     SUSE_PATCHLEVEL=$(awk '/PATCHLEVEL/ {print $3}' /etc/SuSE-release )
     if [ "${SUSE_PATCHLEVEL}" != "" ]; then
@@ -4833,6 +5041,16 @@ install_suse_11_restart_daemons() {
     return 0
 }
 
+
+#
+#   End of SUSE Enterprise 11
+#
+#######################################################################################################################
+#
+# SUSE Enterprise General Functions
+#
+
+# Used for both SLE 11 and 12
 install_suse_check_services() {
     if [ ! -f /bin/systemctl ]; then
         # Not running systemd!? Don't check!
@@ -4852,8 +5070,9 @@ install_suse_check_services() {
     done
     return 0
 }
+
 #
-#   End of SuSE Install Functions.
+# SUSE Enterprise General Functions
 #
 #######################################################################################################################
 
