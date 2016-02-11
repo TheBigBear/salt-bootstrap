@@ -600,7 +600,8 @@ __fetch_url() {
     curl $_CURL_ARGS -L -s -o "$1" "$2" >/dev/null 2>&1 ||
         wget $_WGET_ARGS -q -O "$1" "$2" >/dev/null 2>&1 ||
             fetch $_FETCH_ARGS -q -o "$1" "$2" >/dev/null 2>&1 ||
-                fetch -q -o "$1" "$2" >/dev/null 2>&1           # Pre FreeBSD 10
+                fetch -q -o "$1" "$2" >/dev/null 2>&1 ||        # Pre FreeBSD 10
+                    ftp -o "$1" "$2" >/dev/null 2>&1            # OpenBSD
 }
 
 
@@ -1693,6 +1694,33 @@ __check_services_debian() {
 }   # ----------  end of function __check_services_debian  ----------
 
 
+#---  FUNCTION  -------------------------------------------------------------------------------------------------------
+#          NAME:  __check_services_openbsd
+#   DESCRIPTION:  Return 0 or 1 in case the service is enabled or not
+#    PARAMETERS:  servicename
+#----------------------------------------------------------------------------------------------------------------------
+__check_services_openbsd() {
+    if [ $# -eq 0 ]; then
+        echoerror "You need to pass a service name to check!"
+        exit 1
+    elif [ $# -ne 1 ]; then
+        echoerror "You need to pass a service name to check as the single argument to the function"
+    fi
+
+    servicename=$1
+    echodebug "Checking if service ${servicename} is enabled"
+
+    # shellcheck disable=SC2086,SC2046,SC2144
+    if [ -f /etc/rc.d/${servicename} ] && [ $(grep ${servicename} /etc/rc.conf.local) -ne "" ] ; then
+        echodebug "Service ${servicename} is enabled"
+        return 0
+    else
+        echodebug "Service ${servicename} is NOT enabled"
+        # return 1
+    fi
+}   # ----------  end of function __check_services_openbsd  ----------
+
+
 #######################################################################################################################
 #
 #   Distribution install functions
@@ -1792,6 +1820,8 @@ __enable_universe_repository() {
     else
         add-apt-repository -y "deb http://old-releases.ubuntu.com/ubuntu $(lsb_release -sc) universe" || return 1
     fi
+
+    add-apt-repository -y "deb http://old-releases.ubuntu.com/ubuntu $(lsb_release -sc) universe" || return 1
 
     return 0
 }
@@ -3668,29 +3698,31 @@ install_amazon_linux_ami_2010_git_deps() {
 }
 
 install_amazon_linux_ami_deps() {
-    # According to http://aws.amazon.com/amazon-linux-ami/faqs/#epel we should
+    # enable the EPEL repo
+    /usr/bin/yum-config-manager --enable epel || return 1
 
-    # enable the EPEL 6 repo
-    if [ "$CPU_ARCH_L" = "i686" ]; then
-        EPEL_ARCH="i386"
-    else
-        EPEL_ARCH=$CPU_ARCH_L
-    fi
-    rpm -Uvh --force "http://mirrors.kernel.org/fedora-epel/6/${EPEL_ARCH}/epel-release-6-8.noarch.rpm" || return 1
+    # exclude Salt and ZeroMQ packages from EPEL
+    /usr/bin/yum-config-manager epel --setopt "epel.exclude=zeromq* salt* python-zmq*" --save || return 1
 
-    __REPO_FILENAME="saltstack-salt-epel-6.repo"
+    __REPO_FILENAME="saltstack-repo.repo"
 
     if [ ! -s "/etc/yum.repos.d/${__REPO_FILENAME}" ]; then
-        echoinfo "Adding SaltStack's COPR repository"
-        __fetch_url /etc/yum.repos.d/${__REPO_FILENAME} \
-            "https://copr.fedorainfracloud.org/coprs/saltstack/salt/repo/epel-6/${__REPO_FILENAME}" || return 1
+      cat <<_eof > "/etc/yum.repos.d/${__REPO_FILENAME}"
+[saltstack-repo]
+disabled=False
+name=SaltStack repo for RHEL/CentOS 6
+gpgcheck=1
+gpgkey=https://repo.saltstack.com/yum/redhat/6/\$basearch/$STABLE_REV/SALTSTACK-GPG-KEY.pub
+baseurl=https://repo.saltstack.com/yum/redhat/6/\$basearch/$STABLE_REV/
+humanname=SaltStack repo for RHEL/CentOS 6
+_eof
     fi
 
     if [ "$_UPGRADE_SYS" -eq $BS_TRUE ]; then
         yum -y update || return 1
     fi
 
-    __PACKAGES="PyYAML m2crypto python-crypto python-msgpack python-zmq python-ordereddict python-jinja2 python-requests"
+    __PACKAGES="PyYAML m2crypto python-crypto python-msgpack python-zmq python26-ordereddict python-jinja2 python-requests"
 
     if [ "$_INSTALL_CLOUD" -eq $BS_TRUE ]; then
         check_pip_allowed "You need to allow pip based installations (-P) in order to install apache-libcloud"
@@ -4280,6 +4312,195 @@ install_freebsd_restart_daemons() {
 
 #######################################################################################################################
 #
+#   OpenBSD Install Functions
+#
+
+choose_openbsd_mirror() {
+  MIRRORS_LIST_URL=http://www.openbsd.org/ftp.html
+  MIRRORS_LIST=$(ftp -o - $MIRRORS_LIST_URL |grep href |grep http | grep pub | awk -F \" '{ print $2 }')
+  echoinfo "getting list of mirrors from $MIRRORS_LIST_URL"
+  ping -c 2 -q $(echo $MIRRORS_LIST_URL | awk -F \/ '{ print $3 }') 1>/dev/null || return 1
+  for MIRROR in $MIRRORS_LIST
+    do
+        TIME=$(ping -c 1 -q $(echo $MIRROR | awk -F \/ '{ print $3 }') |grep round-trip |awk -F \/ '{ print $5 }')
+        [ -z $TIME ] && continue
+        echodebug "ping time for $MIRROR is $TIME"
+        [ -z $MINTIME ] && MINTIME=$TIME
+        [ $( echo "$TIME < $MINTIME" |bc ) -eq 1 ] && MINTIME=$TIME && OPENBSD_REPO=$MIRROR || continue
+    done
+}
+
+
+install_openbsd_deps() {
+  choose_openbsd_mirror || return 1
+  [ -z $OPENBSD_REPO ] && return 1
+  echoinfo "setting package repository to $OPENBSD_REPO with ping time of $MINTIME"
+  echo "installpath = ${OPENBSD_REPO}${OS_VERSION}/packages/${CPU_ARCH_L}/" >/etc/pkg.conf || return 1
+  pkg_add -I -v lsof || return 1  
+  pkg_add -I -v py-pip || return 1  
+  ln -sf $(ls -d /usr/local/bin/pip2.*) /usr/local/bin/pip  || return 1 
+  ln -sf $(ls -d /usr/local/bin/pydoc2*) /usr/local/bin/pydoc || return 1 
+  ln -sf $(ls -d /usr/local/bin/python2.[0-9]) /usr/local/bin/python || return 1
+  ln -sf $(ls -d /usr/local/bin/python2.[0-9]*to3) /usr/local/bin/2to3 || return 1
+  ln -sf $(ls -d /usr/local/bin/python2.[0-9]*-config) /usr/local/bin/python-config || return 1
+  pkg_add -I -v swig || return 1
+  pkg_add -I -v py-zmq || return 1
+  pkg_add -I -v py-requests || return 1
+  pkg_add -I -v py-M2Crypto || return 1
+  pkg_add -I -v py-raet || return 1
+  pkg_add -I -v py-libnacl || return 1
+  if [ "$_UPGRADE_SYS" -eq $BS_TRUE ]; then
+      /usr/local/bin/pip install --upgrade pip || return 1
+  fi
+  #
+  # PIP based installs need to copy configuration files "by hand".
+  # Let's trigger config_salt()
+  #
+  if [ "$_TEMP_CONFIG_DIR" = "null" ]; then
+      # Let's set the configuration directory to /tmp
+      _TEMP_CONFIG_DIR="/tmp"
+      CONFIG_SALT_FUNC="config_salt"
+      for fname in minion master syndic api; do
+          # Skip if not meant to be installed
+          [ $fname = "minion" ] && [ "$_INSTALL_MINION" -eq $BS_FALSE ] && continue
+          [ $fname = "master" ] && [ "$_INSTALL_MASTER" -eq $BS_FALSE ] && continue
+          [ $fname = "api" ] && ([ "$_INSTALL_MASTER" -eq $BS_FALSE ] || [ "$(which salt-${fname} 2>/dev/null)" = "" ]) && continue
+          [ $fname = "syndic" ] && [ "$_INSTALL_SYNDIC" -eq $BS_FALSE ] && continue
+
+          # Let's download, since they were not provided, the default configuration files
+          if [ ! -f "$_SALT_ETC_DIR/$fname" ] && [ ! -f "$_TEMP_CONFIG_DIR/$fname" ]; then
+              ftp -o "$_TEMP_CONFIG_DIR/$fname" \
+                  "https://raw.githubusercontent.com/saltstack/salt/develop/conf/$fname" || return 1
+          fi
+      done
+  fi
+  if [ "$_UPGRADE_SYS" -eq $BS_TRUE ]; then
+      /usr/local/bin/pip install --upgrade pip || return 1
+  fi
+  if [ "${_EXTRA_PACKAGES}" != "" ]; then
+      echoinfo "Installing the following extra packages as requested: ${_EXTRA_PACKAGES}"
+      # shellcheck disable=SC2086
+      pkg_add -I -v ${_EXTRA_PACKAGES} || return 1
+  fi
+  return 0
+}
+
+install_openbsd_git_deps() {
+    install_openbsd_deps || return 1
+    pkg_add -I -v git || return 1
+    __git_clone_and_checkout || return 1
+    #
+    # Let's trigger config_salt()
+    #
+    if [ "$_TEMP_CONFIG_DIR" -eq "null" ]; then
+        _TEMP_CONFIG_DIR="${__SALT_GIT_CHECKOUT_DIR}/conf/"
+        CONFIG_SALT_FUNC="config_salt"
+    fi
+    return 0
+}
+
+install_openbsd_stable() {
+    
+#    pkg_add -r -I -v salt || return 1 
+    check_pip_allowed
+      /usr/local/bin/pip install salt || return 1
+     if [ "$_UPGRADE_SYS" -eq $BS_TRUE ]; then
+         /usr/local/bin/pip install --upgrade salt || return 1
+     fi
+    return 0
+}
+
+install_openbsd_git() {
+    #
+    # Install from git
+    #
+    if [ ! -f salt/syspaths.py ]; then
+        # We still can't provide the system paths, salt 0.16.x
+        /usr/local/bin/python2.7 setup.py install || return 1
+    fi
+    return 0
+}
+
+
+install_openbsd_post() {
+
+    #
+    # Install rc.d files.
+    #
+    ## below workaround for /etc/rc.d/rc.subr in OpenBSD >= 5.8 
+    ## is needed for salt services to start/stop properly from /etc/rc.d
+    ## reference: http://cvsweb.openbsd.org/cgi-bin/cvsweb/src/etc/rc.d/rc.subr.diff?r1=1.98&r2=1.99
+    ##
+    if [ $(grep '\-xf' /etc/rc.d/rc.subr)]; then
+      cp -p /etc/rc.d/rc.subr /etc/rc.d/rc.subr
+      sed -i.$(date +%F).saltinstall -e 's:-xf:-f:g' /etc/rc.d/rc.subr
+    fi
+    _TEMP_CONFIG_DIR="/tmp"
+    for fname in minion master syndic api; do
+
+        # Skip if not meant to be installed
+        [ $fname = "minion" ] && [ "$_INSTALL_MINION" -eq $BS_FALSE ] && continue
+        [ $fname = "master" ] && [ "$_INSTALL_MASTER" -eq $BS_FALSE ] && continue
+        [ $fname = "api" ] || [ "$(which salt-${fname} 2>/dev/null)" = "" ] && continue
+        [ $fname = "syndic" ] && continue
+
+        if [ $? -eq 1 ]; then
+            if [ ! -f "$_TEMP_CONFIG_DIR/salt-$fname" ]; then
+                ftp -o "$_TEMP_CONFIG_DIR/salt-$fname" \
+                    "https://raw.githubusercontent.com/saltstack/salt/develop/pkg/openbsd/salt-${fname}.rc-d"
+              if [ ! -f "/etc/rc.d/salt_${fname}" ] && [ $(grep salt_${fname} /etc/rc.conf.local) -eq ""]; then
+                  copyfile "$_TEMP_CONFIG_DIR/salt-$fname" "/etc/rc.d/salt_${fname}" && chmod +x "/etc/rc.d/salt_${fname}" || return 1
+                  echo salt_${fname}_enable="YES" >> /etc/rc.conf.local
+                  echo salt_${fname}_paths=\"/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin\" >>/etc/rc.conf.local
+              fi
+            fi
+        fi
+    done
+}
+
+install_openbsd_check_services() {
+  salt --version 
+    for fname in minion master syndic api; do
+        # Skip salt-api since the service should be opt-in and not necessarily started on boot
+        [ $fname = "api" ] && continue
+
+        # Skip if not meant to be installed
+        [ $fname = "minion" ] && [ "$_INSTALL_MINION" -eq $BS_FALSE ] && continue
+        [ $fname = "master" ] && [ "$_INSTALL_MASTER" -eq $BS_FALSE ] && continue
+        [ $fname = "api" ] && continue
+        [ $fname = "syndic" ] && continue
+        if [ -f /etc/rc.d/salt_${fname} ]; then
+            __check_services_openbsd salt_${fname} || return 1
+        fi
+    done
+    return 0
+}
+
+
+install_openbsd_restart_daemons() {
+  [ $_START_DAEMONS -eq $BS_FALSE ] && return
+  for fname in minion master syndic api; do
+    # Skip salt-api since the service should be opt-in and not necessarily started on boot
+    [ $fname = "api" ] && continue
+    # Skip if not meant to be installed
+    [ $fname = "minion" ] && [ "$_INSTALL_MINION" -eq $BS_FALSE ] && continue
+    [ $fname = "master" ] && [ "$_INSTALL_MASTER" -eq $BS_FALSE ] && continue
+    [ $fname = "syndic" ] && [ "$_INSTALL_SYNDIC" -eq $BS_FALSE ] && continue                                                                                        
+    if [ -f /etc/rc.d/salt_${fname} ]; then
+            /etc/rc.d/salt_${fname} stop > /dev/null 2>&1
+            /etc/rc.d/salt_${fname} start
+    fi
+  done
+}
+
+
+#
+#   Ended OpenBSD Install Functions
+#
+#######################################################################################################################
+
+#######################################################################################################################
+#
 #   SmartOS Install Functions
 #
 install_smartos_deps() {
@@ -4712,6 +4933,7 @@ install_suse_12_stable_deps() {
     if [ "${SUSE_PATCHLEVEL}" != "" ]; then
         DISTRO_PATCHLEVEL="_SP${SUSE_PATCHLEVEL}"
     fi
+    DISTRO_REPO="SLE_${DISTRO_MAJOR_VERSION}${DISTRO_PATCHLEVEL}"
 
     # SLES 12 repo name does not use a patch level so PATCHLEVEL will need to be updated with SP1
     #DISTRO_REPO="SLE_${DISTRO_MAJOR_VERSION}${DISTRO_PATCHLEVEL}"
@@ -4719,11 +4941,11 @@ install_suse_12_stable_deps() {
     DISTRO_REPO="SLE_${DISTRO_MAJOR_VERSION}"
 
     # Is the repository already known
-    __zypper repos | grep devel_languages_python >/dev/null 2>&1
+    __zypper repos | grep systemsmanagement_saltstack >/dev/null 2>&1
     if [ $? -eq 1 ]; then
-        # zypper does not yet know nothing about devel_languages_python
+        # zypper does not yet know nothing about systemsmanagement_saltstack
         __zypper addrepo --refresh \
-            "http://download.opensuse.org/repositories/devel:/languages:/python/${DISTRO_REPO}/devel:languages:python.repo" || return 1
+            "http://download.opensuse.org/repositories/systemsmanagement:saltstack/${DISTRO_REPO}/systemsmanagement:saltstack.repo" || return 1
     fi
 
     __zypper --gpg-auto-import-keys refresh || return 1
