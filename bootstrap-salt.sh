@@ -295,8 +295,10 @@ __usage() {
         per -p flag. You're responsible for providing the proper package name.
     -d  Disable check_service functions. Setting this flag disables the
         'install_<distro>_check_services' checks. You can also do this by
-        touching /tmp/disable_salt_checks on the target host. Default: \${BS_FALSE}
-    -H  Use the specified http proxy for the installation
+        touching /tmp/disable_salt_checks on the target host.
+        Default: \${BS_FALSE}
+    -H  Use the specified HTTP proxy for all download URLs (including https://).
+        For example: http://myproxy.example.com:3128
     -Z  Enable additional package repository for newer ZeroMQ
         (Only available for RHEL/CentOS/Fedora/Ubuntu based distributions)
     -b  Assume that dependencies are already installed and software sources are
@@ -872,7 +874,7 @@ __gather_linux_system_info() {
                 [ "${rv}" != "" ] && v=$(__parse_version_string "$rv") || v=""
                 case $(echo "${nn}" | tr '[:upper:]' '[:lower:]') in
                     amzn        )
-                        # Amazon AMI's after 2014.9 match here
+                        # Amazon AMI's after 2014.09 match here
                         n="Amazon Linux AMI"
                         ;;
                     arch        )
@@ -907,7 +909,7 @@ __gather_linux_system_info() {
 #----------------------------------------------------------------------------------------------------------------------
 __gather_sunos_system_info() {
     if [ -f /sbin/uname ]; then
-        DISTRO_VERSION=$(/sbin/uname -X | awk '/[kK][eE][rR][nN][eE][lL][iI][dD]/ { print $3}')
+        DISTRO_VERSION=$(/sbin/uname -X | awk '/[kK][eE][rR][nN][eE][lL][iI][dD]/ { print $3 }')
     fi
 
     DISTRO_NAME=""
@@ -2935,7 +2937,15 @@ install_fedora_git_deps() {
         # We're on the develop branch, install whichever tornado is on the requirements file
         __REQUIRED_TORNADO="$(grep tornado "${_SALT_GIT_CHECKOUT_DIR}/requirements/base.txt")"
         if [ "${__REQUIRED_TORNADO}" != "" ]; then
-            $FEDORA_PACKAGE_MANAGER install -y python-tornado
+            __check_pip_allowed "You need to allow pip based installations (-P) in order to install tornado"
+
+            # Install pip and pip dependencies
+            if ! __check_command_exists pip; then
+                $FEDORA_PACKAGE_MANAGER install -y python-setuptools python-pip gcc python-devel
+            fi
+
+            pip install -U tornado
+
         fi
     fi
 
@@ -3761,6 +3771,9 @@ install_scientific_linux_check_services() {
 #
 #   Amazon Linux AMI Install Functions
 #
+
+# FIXME: 2010.xx releases are no longer avaliable: https://aws.amazon.com/amazon-linux-ami/
+#        Need to add amazon case to __check_end_of_life_versions
 
 install_amazon_linux_ami_2010_deps() {
     # Linux Amazon AMI 2010.xx seems to use EPEL5 but the system is based on CentOS6.
