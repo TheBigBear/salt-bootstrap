@@ -18,7 +18,7 @@
 #======================================================================================================================
 set -o nounset                              # Treat unset variables as an error
 
-__ScriptVersion="2016.03.10"
+__ScriptVersion="2016.04.18"
 __ScriptName="bootstrap-salt.sh"
 
 #======================================================================================================================
@@ -26,8 +26,11 @@ __ScriptName="bootstrap-salt.sh"
 #----------------------------------------------------------------------------------------------------------------------
 #   * BS_COLORS:                If 0 disables colour support
 #   * BS_PIP_ALLOWED:           If 1 enable pip based installations(if needed)
+#   * BS_PIP_ALL:               If 1 enable all python packages to be installed via pip instead of apt, requires setting virtualenv
+#   * BS_VIRTUALENV_DIR:        The virtualenv to install salt into (shouldn't exist yet)
 #   * BS_ECHO_DEBUG:            If 1 enable debug echo which can also be set by -D
 #   * BS_SALT_ETC_DIR:          Defaults to /etc/salt (Only tweak'able on git based installations)
+#   * BS_SALT_CACHE_DIR:        Defaults to /var/cache/salt (Only tweak'able on git based installations)
 #   * BS_KEEP_TEMP_FILES:       If 1, don't move temporary files, instead copy them
 #   * BS_FORCE_OVERWRITE:       Force overriding copied files(config, init.d, etc)
 #   * BS_UPGRADE_SYS:           If 1 and an option, upgrade system. Default 0.
@@ -189,17 +192,21 @@ _KEEP_TEMP_FILES=${BS_KEEP_TEMP_FILES:-$BS_FALSE}
 _TEMP_CONFIG_DIR="null"
 _SALTSTACK_REPO_URL="git://github.com/saltstack/salt.git"
 _SALT_REPO_URL=${_SALTSTACK_REPO_URL}
+_DOWNSTREAM_PKG_REPO=$BS_FALSE
 _TEMP_KEYS_DIR="null"
 _SLEEP="${__DEFAULT_SLEEP}"
 _INSTALL_MASTER=$BS_FALSE
 _INSTALL_SYNDIC=$BS_FALSE
 _INSTALL_MINION=$BS_TRUE
 _INSTALL_CLOUD=$BS_FALSE
+_VIRTUALENV_DIR=${BS_VIRTUALENV_DIR:-"null"}
 _START_DAEMONS=$BS_TRUE
 _ECHO_DEBUG=${BS_ECHO_DEBUG:-$BS_FALSE}
 _CONFIG_ONLY=$BS_FALSE
 _PIP_ALLOWED=${BS_PIP_ALLOWED:-$BS_FALSE}
+_PIP_ALL=${BS_PIP_ALL:-$BS_FALSE}
 _SALT_ETC_DIR=${BS_SALT_ETC_DIR:-/etc/salt}
+_SALT_CACHE_DIR=${BS_SALT_CACHE_DIR:-/var/cache/salt}
 _PKI_DIR=${_SALT_ETC_DIR}/pki
 _FORCE_OVERWRITE=${BS_FORCE_OVERWRITE:-$BS_FALSE}
 _GENTOO_USE_BINHOST=${BS_GENTOO_USE_BINHOST:-$BS_FALSE}
@@ -223,6 +230,8 @@ _DISABLE_SALT_CHECKS=$BS_FALSE
 _SALT_GIT_CHECKOUT_DIR=${BS_SALT_GIT_CHECKOUT_DIR:-/tmp/git/salt}
 _NO_DEPS=$BS_FALSE
 _FORCE_SHALLOW_CLONE=$BS_FALSE
+_DISABLE_SSL=$BS_FALSE
+_DISABLE_REPOS=$BS_FALSE
 
 
 #---  FUNCTION  -------------------------------------------------------------------------------------------------------
@@ -235,21 +244,28 @@ __usage() {
   Usage :  ${__ScriptName} [options] <install-type> [install-type-args]
 
   Installation types:
-    - stable              (install latest stable release, this is default)
-    - stable [version]    (currently only supported on: Ubuntu, CentOS)
-    - daily               (Ubuntu specific: configure SaltStack Daily PPA)
-    - testing             (RHEL-family specific: configure EPEL testing repo)
-    - git [branch_or_tag] (install from 'develop' by default)
+    - stable              Install latest stable release. This is the default
+                          install type
+    - stable [branch]     Install latest version on a branch. Only supported
+                          for packages available at repo.saltstack.com
+    - stable [version]    Install a specific version. Only supported for
+                          packages available at repo.saltstack.com
+    - daily               Ubuntu specific: configure SaltStack Daily PPA
+    - testing             RHEL-family specific: configure EPEL testing repo
+    - git                 Install from the head of the develop branch
+    - git [ref]           Install from any git ref (such as a branch, tag, or
+                          commit)
 
   Examples:
     - ${__ScriptName}
     - ${__ScriptName} stable
     - ${__ScriptName} stable 2015.8
+    - ${__ScriptName} stable 2015.8.9
     - ${__ScriptName} daily
     - ${__ScriptName} testing
     - ${__ScriptName} git
-    - ${__ScriptName} git develop
-    - ${__ScriptName} git v2015.8.5
+    - ${__ScriptName} git 2015.8
+    - ${__ScriptName} git v2015.8.9
     - ${__ScriptName} git 8c3fadf15ec183e5ce8c63739850d543617e4357
 
   Options:
@@ -263,6 +279,9 @@ __usage() {
         https://${_SALTSTACK_REPO_URL#*://}
         (Usually necessary on systems which have the regular git protocol port
         blocked, where https usually is not)
+    -w  Install packages from downstream package repository rather than
+        upstream, saltstack package repository.  This is currently only
+        implemented for SUSE.
     -k  Temporary directory holding the minion keys which will pre-seed
         the master.
     -s  Sleep time used when waiting for daemons to start, restart and when
@@ -306,12 +325,21 @@ __usage() {
         step.
     -f  Force shallow cloning for git installations.
         This may result in an "n/a" in the version number.
+    -l  Disable ssl checks. When passed, switches "https" calls to "http" where
+        possible.
+    -V  Install salt into virtualenv(Only available for Ubuntu base distributions)
+    -a  Pip install all python pkg dependencies for salt. Requires -V to install
+        all pip pkgs into the virtualenv(Only available for Ubuntu base
+        distributions)
+    -r  Disable all repository configuration performed by this script. This
+        option assumes all necessary repository configuration is already present
+        on the system.
 
 EOT
 }   # ----------  end of function __usage  ----------
 
 
-while getopts ":hvnDc:Gg:k:s:MSNXCPFUKIA:i:Lp:dH:Zbf" opt
+while getopts ":hvnDc:Gg:wk:s:MSNXCPFUKIA:i:Lp:dH:ZbflV:ar" opt
 do
   case "${opt}" in
 
@@ -332,7 +360,7 @@ do
          fi
          ;;
 
-    g )  _SALT_REPO_URL=$OPTARG                          ;;
+    g )  _SALT_REPO_URL=$OPTARG                         ;;
 
     G )  if [ "${_SALT_REPO_URL}" = "${_SALTSTACK_REPO_URL}" ]; then
              _SALTSTACK_REPO_URL="https://github.com/saltstack/salt.git"
@@ -342,6 +370,8 @@ do
          fi
          ;;
 
+    w )  _DOWNSTREAM_PKG_REPO=$BS_TRUE                  ;;
+
     k )  _TEMP_KEYS_DIR="$OPTARG"
          # If the configuration directory does not exist, error out
          if [ ! -d "$_TEMP_KEYS_DIR" ]; then
@@ -349,7 +379,6 @@ do
              exit 1
          fi
          ;;
-
     s )  _SLEEP=$OPTARG                                 ;;
     M )  _INSTALL_MASTER=$BS_TRUE                       ;;
     S )  _INSTALL_SYNDIC=$BS_TRUE                       ;;
@@ -370,6 +399,10 @@ do
     Z )  _ENABLE_EXTERNAL_ZMQ_REPOS=$BS_TRUE            ;;
     b )  _NO_DEPS=$BS_TRUE                              ;;
     f )  _FORCE_SHALLOW_CLONE=$BS_TRUE                  ;;
+    l )  _DISABLE_SSL=$BS_TRUE                          ;;
+    V )  _VIRTUALENV_DIR="$OPTARG"                      ;;
+    a )  _PIP_ALL=$BS_TRUE                              ;;
+    r )  _DISABLE_REPOS=$BS_TRUE                        ;;
 
     \?)  echo
          echoerror "Option does not exist : $OPTARG"
@@ -413,7 +446,7 @@ if [ "$_INSTALL_MINION" -eq $BS_FALSE ] && [ "$_SALT_MASTER_ADDRESS" != "null" ]
     exit 1
 fi
 
-# Check that we're installing a minion if we're being passed a master address
+# Check that we're installing a minion if we're being passed a minion id
 if [ "$_INSTALL_MINION" -eq $BS_FALSE ] && [ "$_SALT_MINION_ID" != "null" ]; then
     echoerror "Don't pass a minion id (-i) if no minion is going to be bootstrapped."
     exit 1
@@ -450,13 +483,29 @@ elif [ "$ITYPE" = "stable" ]; then
         STABLE_REV="latest"
     else
         __check_unparsed_options "$*"
-        if [ "$(echo "$1" | egrep '^(latest|1\.6|1\.7|2014\.1|2014\.7|2015\.5|2015\.8)$')" = "" ]; then
-          echo "Unknown stable version: $1 (valid: 1.6, 1.7, 2014.1, 2014.7, 2015.5, 2015.8, latest)"
-          exit 1
-        else
+        if [ "$(echo "$1" | egrep '^(latest|1\.6|1\.7|2014\.1|2014\.7|2015\.5|2015\.8)$')" != "" ]; then
           STABLE_REV="$1"
           shift
+        elif [ "$(echo "$1" | egrep '^([0-9]*\.[0-9]*\.[0-9]*)$')" != "" ]; then
+          STABLE_REV="archive/$1"
+          shift
+        else
+          echo "Unknown stable version: $1 (valid: 1.6, 1.7, 2014.1, 2014.7, 2015.5, 2015.8, latest, \$MAJOR.\$MINOR.\$PATCH)"
+          exit 1
+
         fi
+    fi
+fi
+
+# -a and -V only work from git
+if [ "$ITYPE" != "git" ]; then
+    if [ $_PIP_ALL -eq $BS_TRUE ]; then
+        echoerror "Pip installing all python packages with -a is only possible when installing salt via git"
+        exit 1
+    fi
+    if [ "$_VIRTUALENV_DIR" != "null" ]; then
+        echoerror "Virtualenv installs via -V is only possible when installing salt via git"
+        exit 1
     fi
 fi
 
@@ -467,6 +516,13 @@ if [ "$#" -gt 0 ]; then
     echo
     echoerror "Too many arguments."
     exit 1
+fi
+
+# Check the _DISABLE_SSL value and set HTTP or HTTPS.
+if [ "$_DISABLE_SSL" -eq "${BS_TRUE}" ]; then
+    HTTP_VAL="http"
+else
+    HTTP_VAL="https"
 fi
 
 # whoami alternative for SunOS
@@ -500,6 +556,20 @@ fi
 if [ ${_DISABLE_SALT_CHECKS} -eq 0 ]; then
     [ -f /tmp/disable_salt_checks ] && _DISABLE_SALT_CHECKS=$BS_TRUE && \
         echowarn "Found file: /tmp/disable_salt_checks, setting \$_DISABLE_SALT_CHECKS=true"
+fi
+
+# Because -a can only be installed into virtualenv
+if ([ $_PIP_ALL -eq $BS_TRUE ] && [ "$_VIRTUALENV_DIR" = "null" ]); then
+    usage
+    # Could possibly set up a default virtualenv location when -a flag is passed
+    echoerror "Using -a requires -V because pip pkgs should be siloed from python system pkgs"
+    exit 1
+fi
+
+# Make sure virtualenv directory does not already exist
+if [ -d "$_VIRTUALENV_DIR" ]; then
+    echoerror "The directory ${_VIRTUALENV_DIR} for virtualenv already exists"
+    exit 1
 fi
 
 echoinfo "${CALLER} ${0} -- Version ${__ScriptVersion}"
@@ -610,6 +680,27 @@ __fetch_url() {
                     ftp -o "$1" "$2" >/dev/null 2>&1            # OpenBSD
 }
 
+#---  FUNCTION  -------------------------------------------------------------------------------------------------------
+#         NAME:  __fetch_verify
+#  DESCRIPTION:  Retrieves a URL, verifies its content and writes it to standard output
+#----------------------------------------------------------------------------------------------------------------------
+__fetch_verify() {
+    fetch_verify_url="$1"
+    fetch_verify_sum="$2"
+    fetch_verify_size="$3"
+
+    fetch_verify_tmpf=$(mktemp) && \
+    __fetch_url "$fetch_verify_tmpf" "$fetch_verify_url" && \
+    test "$(stat --format=%s "$fetch_verify_tmpf")" -eq "$fetch_verify_size" && \
+    test "$(md5sum "$fetch_verify_tmpf" | awk '{ print $1 }')" = "$fetch_verify_sum" && \
+    cat "$fetch_verify_tmpf" && \
+    rm -f "$fetch_verify_tmpf"
+    if [ $? -eq 0 ]; then
+        return 0
+    fi
+    echo "Failed verification of $fetch_verify_url"
+    return 1
+}
 
 #---  FUNCTION  -------------------------------------------------------------------------------------------------------
 #          NAME:  __gather_hardware_info
@@ -1145,6 +1236,22 @@ __debian_derivatives_translation() {
     fi
 }
 
+#---  FUNCTION  -------------------------------------------------------------------------------------------------------
+#          NAME:  __set_suse_pkg_repo
+#   DESCRIPTION:  Set SUSE_PKG_URL to either the upstream SaltStack repo or the
+#                 downstream SUSE repo
+#----------------------------------------------------------------------------------------------------------------------
+__set_suse_pkg_repo() {
+    suse_pkg_url_path="${DISTRO_REPO}/systemsmanagement:saltstack.repo"
+    if [ "$_DOWNSTREAM_PKG_REPO" -eq $BS_TRUE ]; then
+        # FIXME: cleartext download over unsecure protocol (HTTP)
+        suse_pkg_url_base="http://download.opensuse.org/repositories/systemsmanagement:saltstack"
+    else
+        suse_pkg_url_base="${HTTP_VAL}://repo.saltstack.com/opensuse"
+    fi
+    SUSE_PKG_URL="$suse_pkg_url_base/$suse_pkg_url_path"
+}
+
 __gather_system_info
 
 echo
@@ -1231,7 +1338,7 @@ __ubuntu_codename_translation
 if ([ "${DISTRO_NAME_L}" != "ubuntu" ] && [ "$ITYPE" = "daily" ]); then
     echoerror "${DISTRO_NAME} does not have daily packages support"
     exit 1
-elif ([ "$(echo "${DISTRO_NAME_L}" | egrep '(ubuntu|centos)')" = "" ] && [ "$ITYPE" = "stable" ] && [ "$STABLE_REV" != "latest" ]); then
+elif ([ "$(echo "${DISTRO_NAME_L}" | egrep '(debian|ubuntu|centos|red_hat|oracle|scientific)')" = "" ] && [ "$ITYPE" = "stable" ] && [ "$STABLE_REV" != "latest" ]); then
     echoerror "${DISTRO_NAME} does not have major version pegged packages support"
     exit 1
 fi
@@ -1245,6 +1352,17 @@ if [ "${ITYPE}" = "testing" ]; then
     _EPEL_REPO="epel-testing"
 fi
 
+# Only Ubuntu has support for installing to virtualenvs
+if ([ "${DISTRO_NAME_L}" != "ubuntu" ] && [ "$_VIRTUALENV_DIR" != "null" ]); then
+    echoerror "${DISTRO_NAME} does not have -V support"
+    exit 1
+fi
+
+# Only Ubuntu has support for pip installing all packages
+if ([ "${DISTRO_NAME_L}" != "ubuntu" ] && [ $_PIP_ALL -eq $BS_TRUE ]);then
+    echoerror "${DISTRO_NAME} does not have -a support"
+    exit 1
+fi
 #---  FUNCTION  -------------------------------------------------------------------------------------------------------
 #          NAME:  __function_defined
 #   DESCRIPTION:  Checks if a function is defined within this scripts scope
@@ -1809,6 +1927,77 @@ __check_services_openbsd() {
 }   # ----------  end of function __check_services_openbsd  ----------
 
 
+#---  FUNCTION  -------------------------------------------------------------------------------------------------------
+#          NAME:  __create_virtualenv
+#   DESCRIPTION:  Return 0 or 1 depending on successful creation of virtualenv
+#----------------------------------------------------------------------------------------------------------------------
+__create_virtualenv() {
+    if [ ! -d "$_VIRTUALENV_DIR" ]; then
+        echoinfo "Creating virtualenv ${_VIRTUALENV_DIR}"
+        if [ $_PIP_ALL -eq $BS_TRUE ]; then
+            virtualenv --no-site-packages "${_VIRTUALENV_DIR}" || return 1
+        else
+            virtualenv --system-site-packages "${_VIRTUALENV_DIR}" || return 1
+        fi
+    fi
+    return 0
+}   # ----------  end of function __create_virtualenv  ----------
+
+
+#---  FUNCTION  -------------------------------------------------------------------------------------------------------
+#          NAME:  __activate_virtualenv
+#   DESCRIPTION:  Return 0 or 1 depending on successful activation of virtualenv
+#----------------------------------------------------------------------------------------------------------------------
+__activate_virtualenv() {
+    set +o nounset
+    # Is virtualenv empty
+    if [ -z "$VIRTUAL_ENV" ]; then
+        __create_virtualenv || return 1
+        # shellcheck source=/dev/null
+        . "${_VIRTUALENV_DIR}/bin/activate" || return 1
+        echoinfo "Activated virtualenv ${_VIRTUALENV_DIR}"
+    fi
+    set -o nounset
+    return 0
+}   # ----------  end of function __activate_virtualenv  ----------
+
+
+#---  FUNCTION  -------------------------------------------------------------------------------------------------------
+#          NAME:  __install_pip_deps
+#   DESCRIPTION:  Return 0 or 1 if successfully able to install pip packages via requirements file
+#    PARAMETERS:  requirements_files
+#----------------------------------------------------------------------------------------------------------------------
+__install_pip_deps() {
+    # Install virtualenv to system pip before activating virtualenv if thats going to be used
+    # We assume pip pkg is installed since that is distro specific
+    if [ "$_VIRTUALENV_DIR" != "null" ]; then
+        if ! __check_command_exists pip; then
+            echoerror "Pip not installed: required for -a installs"
+            exit 1
+        fi
+        pip install -U virtualenv
+        __activate_virtualenv || return 1
+    else
+        echoerror "Must have virtualenv dir specified for -a installs"
+    fi
+
+    requirements_file=$1
+    if [ ! -f "${requirements_file}" ]; then
+        echoerror "Requirements file: ${requirements_file} cannot be found, needed for -a (pip pkg) installs"
+        exit 1
+    fi
+
+    __PIP_PACKAGES=''
+    if [ "$_INSTALL_CLOUD" -eq $BS_TRUE ]; then
+        # shellcheck disable=SC2089
+        __PIP_PACKAGES="${__PIP_PACKAGES} 'apache-libcloud>=$_LIBCLOUD_MIN_VERSION'"
+    fi
+
+    # shellcheck disable=SC2086,SC2090
+    pip install -U -r ${requirements_file} ${__PIP_PACKAGES}
+}
+
+
 #######################################################################################################################
 #
 #   Distribution install functions
@@ -1939,30 +2128,33 @@ install_ubuntu_deps() {
         __apt_get_install_noinput python-software-properties || return 1
     fi
 
-    __enable_universe_repository || return 1
 
-    # the latest version of 2015.5 and all versions of 2015.8 and beyond are hosted on repo.saltstack.com
-    if [ "$(echo "$STABLE_REV" | egrep '^(2015\.5|2015\.8|latest)$')" = "" ]; then
-        if [ "$DISTRO_MAJOR_VERSION" -lt 14 ]; then
-            echoinfo "Installing Python Requests/Chardet from Chris Lea's PPA repository"
-            if [ "$DISTRO_MAJOR_VERSION" -gt 11 ] || ([ "$DISTRO_MAJOR_VERSION" -eq 11 ] && [ "$DISTRO_MINOR_VERSION" -gt 04 ]); then
-                # Above Ubuntu 11.04 add a -y flag
-                add-apt-repository -y "ppa:chris-lea/python-requests" || return 1
-                add-apt-repository -y "ppa:chris-lea/python-chardet" || return 1
-                add-apt-repository -y "ppa:chris-lea/python-urllib3" || return 1
-                add-apt-repository -y "ppa:chris-lea/python-crypto" || return 1
-            else
-                add-apt-repository "ppa:chris-lea/python-requests" || return 1
-                add-apt-repository "ppa:chris-lea/python-chardet" || return 1
-                add-apt-repository "ppa:chris-lea/python-urllib3" || return 1
-                add-apt-repository "ppa:chris-lea/python-crypto" || return 1
+    if [ $_DISABLE_REPOS -eq $BS_FALSE ]; then
+        __enable_universe_repository || return 1
+
+        # Versions starting with 2015.5.6 and 2015.8.1 are hosted at repo.saltstack.com
+        if [ "$(echo "$STABLE_REV" | egrep '^(2015\.5|2015\.8|latest|archive\/)')" = "" ]; then
+            if [ "$DISTRO_MAJOR_VERSION" -lt 14 ]; then
+                echoinfo "Installing Python Requests/Chardet from Chris Lea's PPA repository"
+                if [ "$DISTRO_MAJOR_VERSION" -gt 11 ] || ([ "$DISTRO_MAJOR_VERSION" -eq 11 ] && [ "$DISTRO_MINOR_VERSION" -gt 04 ]); then
+                    # Above Ubuntu 11.04 add a -y flag
+                    add-apt-repository -y "ppa:chris-lea/python-requests" || return 1
+                    add-apt-repository -y "ppa:chris-lea/python-chardet" || return 1
+                    add-apt-repository -y "ppa:chris-lea/python-urllib3" || return 1
+                    add-apt-repository -y "ppa:chris-lea/python-crypto" || return 1
+                else
+                    add-apt-repository "ppa:chris-lea/python-requests" || return 1
+                    add-apt-repository "ppa:chris-lea/python-chardet" || return 1
+                    add-apt-repository "ppa:chris-lea/python-urllib3" || return 1
+                    add-apt-repository "ppa:chris-lea/python-crypto" || return 1
+                fi
             fi
-        fi
 
-        if [ "$DISTRO_MAJOR_VERSION" -gt 12 ] || ([ "$DISTRO_MAJOR_VERSION" -eq 12 ] && [ "$DISTRO_MINOR_VERSION" -gt 03 ]); then
-            if ([ "$DISTRO_MAJOR_VERSION" -lt 15 ] && [ "$_ENABLE_EXTERNAL_ZMQ_REPOS" -eq $BS_TRUE ]); then
-                echoinfo "Installing ZMQ>=4/PyZMQ>=14 from Chris Lea's PPA repository"
-                add-apt-repository -y ppa:chris-lea/zeromq || return 1
+            if [ "$DISTRO_MAJOR_VERSION" -gt 12 ] || ([ "$DISTRO_MAJOR_VERSION" -eq 12 ] && [ "$DISTRO_MINOR_VERSION" -gt 03 ]); then
+                if ([ "$DISTRO_MAJOR_VERSION" -lt 15 ] && [ "$_ENABLE_EXTERNAL_ZMQ_REPOS" -eq $BS_TRUE ]); then
+                    echoinfo "Installing ZMQ>=4/PyZMQ>=14 from Chris Lea's PPA repository"
+                    add-apt-repository -y ppa:chris-lea/zeromq || return 1
+                fi
             fi
         fi
     fi
@@ -1972,15 +2164,20 @@ install_ubuntu_deps() {
     # Minimal systems might not have upstart installed, install it
     __PACKAGES="upstart"
 
+    if [ "$DISTRO_MAJOR_VERSION" -ge 15 ]; then
+        __PACKAGES="${__PACKAGES} python2.7"
+    fi
+    if [ "$_VIRTUALENV_DIR" != "null" ]; then
+        __PACKAGES="${__PACKAGES} python-virtualenv"
+    fi
     # Need python-apt for managing packages via Salt
     __PACKAGES="${__PACKAGES} python-apt"
 
     # requests is still used by many salt modules
     __PACKAGES="${__PACKAGES} python-requests"
 
-    # Additionally install procps and pciutils which allows for Docker boostraps. See 366#issuecomment-39666813
+    # Additionally install procps and pciutils which allows for Docker bootstraps. See 366#issuecomment-39666813
     __PACKAGES="${__PACKAGES} procps pciutils"
-
 
     if [ "$_INSTALL_CLOUD" -eq $BS_TRUE ]; then
         __check_pip_allowed "You need to allow pip based installations (-P) in order to install 'apache-libcloud'"
@@ -1997,7 +2194,10 @@ install_ubuntu_deps() {
 
     if [ "${__PIP_PACKAGES}" != "" ]; then
         # shellcheck disable=SC2086,SC2090
-        pip install -U ${__PIP_PACKAGES}
+        if [ "$_VIRTUALENV_DIR" != "null" ]; then
+            __activate_virtualenv
+        fi
+        pip install -U "${__PIP_PACKAGES}"
     fi
 
     if [ "$_UPGRADE_SYS" -eq $BS_TRUE ]; then
@@ -2014,47 +2214,61 @@ install_ubuntu_deps() {
 }
 
 install_ubuntu_stable_deps() {
-    # This probably holds true for the Debians as well
-    if [ "$CPU_ARCH_L" = "amd64" ] || [ "$CPU_ARCH_L" = "x86_64" ]; then
-        repo_arch="amd64"
-    elif [ "$CPU_ARCH_L" = "i386" ] || [ "$CPU_ARCH_L" = "i686" ]; then
-        echoerror "repo.saltstack.com likely doesn't have 32-bit packages for Ubuntu (yet?)"
-        repo_arch="i386"
+
+    if [ $_DISABLE_REPOS -eq $BS_FALSE ]; then
+        if [ "$CPU_ARCH_L" = "amd64" ] || [ "$CPU_ARCH_L" = "x86_64" ]; then
+            repo_arch="amd64"
+        elif [ "$CPU_ARCH_L" = "i386" ] || [ "$CPU_ARCH_L" = "i686" ]; then
+            echoerror "repo.saltstack.com likely doesn't have 32-bit packages for Ubuntu (yet?)"
+            repo_arch="i386"
+        fi
     fi
 
     install_ubuntu_deps || return 1
 
-    # the latest version of 2015.5 and all versions of 2015.8 and beyond are hosted on repo.saltstack.com
-    if [ "$(echo "$STABLE_REV" | egrep '^(2015\.5|2015\.8|latest)$')" != "" ]; then
+    if [ $_DISABLE_REPOS -eq $BS_FALSE ]; then
+        # Versions starting with 2015.5.6 and 2015.8.1 are hosted at repo.saltstack.com
+        if [ "$(echo "$STABLE_REV" | egrep '^(2015\.5|2015\.8|latest|archive\/)')" != "" ]; then
+            # Workaround for latest non-LTS ubuntu
+            if [ "$DISTRO_MAJOR_VERSION" -eq 15 ]; then
+                echowarn "Non-LTS Ubuntu detected, but stable packages requested. Trying packages from latest LTS release. You may experience problems"
+                UBUNTU_VERSION=14.04
+                UBUNTU_CODENAME=trusty
+            else
+                UBUNTU_VERSION=$DISTRO_VERSION
+                UBUNTU_CODENAME=$DISTRO_CODENAME
+            fi
 
-        # Saltstack's Stable Ubuntu repository
-        if [ "$(grep -ER 'latest .+ main' /etc/apt)" = "" ]; then
-            echo "deb http://repo.saltstack.com/apt/ubuntu/$DISTRO_VERSION/$repo_arch/$STABLE_REV $DISTRO_CODENAME main" >> \
-                "/etc/apt/sources.list.d/salt-$STABLE_REV.list"
-        fi
+            # SaltStack's stable Ubuntu repository
+            SALTSTACK_UBUNTU_URL="${HTTP_VAL}://repo.saltstack.com/apt/ubuntu/$UBUNTU_VERSION/$repo_arch/$STABLE_REV"
+            if [ "$(grep -ER 'latest .+ main' /etc/apt)" = "" ]; then
+                set +o nounset
+                echo "deb $SALTSTACK_UBUNTU_URL $UBUNTU_CODENAME main" > "/etc/apt/sources.list.d/saltstack.list"
+                set -o nounset
+            fi
 
+            # Make sure wget is available
+            __apt_get_install_noinput wget
 
-        # Make sure wget is available
-        __apt_get_install_noinput wget
+            # shellcheck disable=SC2086
+            wget $_WGET_ARGS -q $SALTSTACK_UBUNTU_URL/SALTSTACK-GPG-KEY.pub -O - | apt-key add - || return 1
 
-        # shellcheck disable=SC2086
-        wget $_WGET_ARGS -q https://repo.saltstack.com/apt/ubuntu/$DISTRO_VERSION/$repo_arch/$STABLE_REV/SALTSTACK-GPG-KEY.pub -O - | apt-key add - || return 1
-
-    else
-        # Alternate PPAs: salt16, salt17, salt2014-1, salt2014-7
-        if [ ! "$(echo "$STABLE_REV" | egrep '^(1\.6|1\.7)$')" = "" ]; then
-          STABLE_PPA="saltstack/salt$(echo "$STABLE_REV" | tr -d .)"
-        elif [ ! "$(echo "$STABLE_REV" | egrep '^(2014\.1|2014\.7)$')" = "" ]; then
-          STABLE_PPA="saltstack/salt$(echo "$STABLE_REV" | tr . -)"
         else
-          STABLE_PPA="saltstack/salt"
-        fi
+            # Alternate PPAs: salt16, salt17, salt2014-1, salt2014-7
+            if [ ! "$(echo "$STABLE_REV" | egrep '^(1\.6|1\.7)$')" = "" ]; then
+              STABLE_PPA="saltstack/salt$(echo "$STABLE_REV" | tr -d .)"
+            elif [ ! "$(echo "$STABLE_REV" | egrep '^(2014\.1|2014\.7)$')" = "" ]; then
+              STABLE_PPA="saltstack/salt$(echo "$STABLE_REV" | tr . -)"
+            else
+              STABLE_PPA="saltstack/salt"
+            fi
 
-        if [ "$DISTRO_MAJOR_VERSION" -gt 11 ] || ([ "$DISTRO_MAJOR_VERSION" -eq 11 ] && [ "$DISTRO_MINOR_VERSION" -gt 04 ]); then
-            # Above Ubuntu 11.04 add a -y flag
-            add-apt-repository -y "ppa:$STABLE_PPA" || return 1
-        else
-            add-apt-repository "ppa:$STABLE_PPA" || return 1
+            if [ "$DISTRO_MAJOR_VERSION" -gt 11 ] || ([ "$DISTRO_MAJOR_VERSION" -eq 11 ] && [ "$DISTRO_MINOR_VERSION" -gt 04 ]); then
+                # Above Ubuntu 11.04 add a -y flag
+                add-apt-repository -y "ppa:$STABLE_PPA" || return 1
+            else
+                add-apt-repository "ppa:$STABLE_PPA" || return 1
+            fi
         fi
     fi
 
@@ -2063,6 +2277,7 @@ install_ubuntu_stable_deps() {
 
 install_ubuntu_daily_deps() {
     install_ubuntu_deps || return 1
+
     if [ "$DISTRO_MAJOR_VERSION" -ge 12 ]; then
         # Above Ubuntu 11.10 add-apt-repository is in a different package
         __apt_get_install_noinput software-properties-common || return 1
@@ -2070,17 +2285,19 @@ install_ubuntu_daily_deps() {
         __apt_get_install_noinput python-software-properties || return 1
     fi
 
-    __enable_universe_repository || return 1
+    if [ $_DISABLE_REPOS -eq $BS_FALSE ]; then
+        __enable_universe_repository || return 1
 
-    # for anything up to and including 11.04 do not use the -y option
-    if [ "$DISTRO_MAJOR_VERSION" -gt 11 ] || ([ "$DISTRO_MAJOR_VERSION" -eq 11 ] && [ "$DISTRO_MINOR_VERSION" -gt 04 ]); then
-        # Above Ubuntu 11.04 add a -y flag
-        add-apt-repository -y ppa:saltstack/salt-daily || return 1
-    else
-        add-apt-repository ppa:saltstack/salt-daily || return 1
+        # for anything up to and including 11.04 do not use the -y option
+        if [ "$DISTRO_MAJOR_VERSION" -gt 11 ] || ([ "$DISTRO_MAJOR_VERSION" -eq 11 ] && [ "$DISTRO_MINOR_VERSION" -gt 04 ]); then
+            # Above Ubuntu 11.04 add a -y flag
+            add-apt-repository -y ppa:saltstack/salt-daily || return 1
+        else
+            add-apt-repository ppa:saltstack/salt-daily || return 1
+        fi
+
+        apt-get update
     fi
-
-    apt-get update
 
     if [ "$_UPGRADE_SYS" -eq $BS_TRUE ]; then
         __apt_get_upgrade_noinput || return 1
@@ -2090,25 +2307,37 @@ install_ubuntu_daily_deps() {
 }
 
 install_ubuntu_git_deps() {
-    install_ubuntu_deps || return 1
-    __apt_get_install_noinput git-core python-yaml python-m2crypto python-crypto \
-        msgpack-python python-zmq python-jinja2 || return 1
-
+    __apt_get_install_noinput git-core || return 1
     __git_clone_and_checkout || return 1
 
     __PACKAGES=""
-    if [ -f "${_SALT_GIT_CHECKOUT_DIR}/requirements/base.txt" ]; then
-        # We're on the develop branch, install whichever tornado is on the requirements file
-        __REQUIRED_TORNADO="$(grep tornado "${_SALT_GIT_CHECKOUT_DIR}/requirements/base.txt")"
-        if [ "${__REQUIRED_TORNADO}" != "" ]; then
-            __PACKAGES="${__PACKAGES} python-dev"
-            __check_pip_allowed "You need to allow pip based installations (-P) in order to install the python package '${__REQUIRED_TORNADO}'"
-            if ! __check_command_exists pip; then
-                __PACKAGES="${__PACKAGES} python-setuptools python-pip"
+    # See how we are installing packages
+    if [ ${_PIP_ALL} -eq $BS_TRUE ]; then
+        __PACKAGES="python-dev swig libssl-dev libzmq3 libzmq3-dev"
+        if ! __check_command_exists pip; then
+            __PACKAGES="${__PACKAGES} python-setuptools python-pip"
+        fi
+        # Get just the apt packages that are required to build all the pythons
+        __apt_get_install_noinput "$__PACKAGES" || return 1
+        # Install the pythons from requirements (only zmq for now)
+        __install_pip_deps "${_SALT_GIT_CHECKOUT_DIR}/requirements/zeromq.txt" || return 1
+    else
+        install_ubuntu_deps || return 1
+        __apt_get_install_noinput python-yaml python-m2crypto python-crypto \
+            msgpack-python python-zmq python-jinja2 || return 1
+        if [ -f "${_SALT_GIT_CHECKOUT_DIR}/requirements/base.txt" ]; then
+            # We're on the develop branch, install whichever tornado is on the requirements file
+            __REQUIRED_TORNADO="$(grep tornado "${_SALT_GIT_CHECKOUT_DIR}/requirements/base.txt")"
+            if [ "${__REQUIRED_TORNADO}" != "" ]; then
+                __PACKAGES="${__PACKAGES} python-dev"
+                check_pip_allowed "You need to allow pip based installations (-P) in order to install the python package '${__REQUIRED_TORNADO}'"
+                if ! __check_command_exists pip; then
+                    __PACKAGES="${__PACKAGES} python-setuptools python-pip"
+                fi
+                # shellcheck disable=SC2086
+                __apt_get_install_noinput $__PACKAGES || return 1
+                pip install -U "${__REQUIRED_TORNADO}"
             fi
-            # shellcheck disable=SC2086
-            __apt_get_install_noinput $__PACKAGES
-            pip install -U "${__REQUIRED_TORNADO}"
         fi
     fi
 
@@ -2143,14 +2372,49 @@ install_ubuntu_daily() {
 }
 
 install_ubuntu_git() {
+    # Activate virtualenv before install
+    if [ "${_VIRTUALENV_DIR}" != "null" ]; then
+        __activate_virtualenv || return 1
+    fi
+
     if [ -f "${_SALT_GIT_CHECKOUT_DIR}/salt/syspaths.py" ]; then
-        python setup.py --salt-config-dir="$_SALT_ETC_DIR" install --install-layout=deb || return 1
+        python setup.py --salt-config-dir="$_SALT_ETC_DIR" --salt-cache-dir="${_SALT_CACHE_DIR}" install --install-layout=deb || return 1
     else
         python setup.py install --install-layout=deb || return 1
     fi
     return 0
 }
 
+install_ubuntu_stable_post() {
+    # Workaround for latest LTS packages on latest ubuntu. Normally packages on
+    # debian-based systems will automatically start the corresponding daemons
+    if [ "$DISTRO_MAJOR_VERSION" -ne 15 ]; then
+       return 0
+    fi
+
+    for fname in minion master syndic api; do
+        # Skip if not meant to be installed
+        # Skip salt-api since the service should be opt-in and not necessarily started on boot
+        [ $fname = "api" ] && continue
+
+        [ $fname = "minion" ] && [ "$_INSTALL_MINION" -eq $BS_FALSE ] && continue
+        [ $fname = "master" ] && [ "$_INSTALL_MASTER" -eq $BS_FALSE ] && continue
+        #[ $fname = "api" ] && ([ "$_INSTALL_MASTER" -eq $BS_FALSE ] || ! __check_command_exists "salt-${fname}") && continue
+        [ $fname = "syndic" ] && [ "$_INSTALL_SYNDIC" -eq $BS_FALSE ] && continue
+
+        if [ -f /bin/systemctl ]; then
+            # Using systemd
+            /bin/systemctl is-enabled salt-$fname.service > /dev/null 2>&1 || (
+                /bin/systemctl preset salt-$fname.service > /dev/null 2>&1 &&
+                /bin/systemctl enable salt-$fname.service > /dev/null 2>&1
+            )
+            sleep 0.1
+            /usr/bin/systemctl daemon-reload
+        elif [ -f /etc/init.d/salt-$fname ]; then
+            update-rc.d salt-$fname defaults
+        fi
+    done
+}
 install_ubuntu_git_post() {
     for fname in minion master syndic api; do
 
@@ -2178,6 +2442,10 @@ install_ubuntu_git_post() {
                 echowarn "Upstart does not appear to know about salt-$fname"
                 echodebug "Copying ${_SALT_GIT_CHECKOUT_DIR}/pkg/salt-$fname.upstart to $_upstart_conf"
                 __copyfile "${_SALT_GIT_CHECKOUT_DIR}/pkg/salt-${fname}.upstart" "$_upstart_conf"
+                # Set service to know about virtualenv
+                if [ "${_VIRTUALENV_DIR}" != "null" ]; then
+                    echo "SALT_USE_VIRTUALENV=${_VIRTUALENV_DIR}" > /etc/default/salt-${fname}
+                fi
                 /sbin/initctl reload-configuration || return 1
             fi
         # No upstart support in Ubuntu!?
@@ -2192,7 +2460,7 @@ install_ubuntu_git_post() {
 
             update-rc.d salt-$fname defaults
         else
-            echoerror "Neither upstart not init.d was setup for salt-$fname"
+            echoerror "Neither upstart nor init.d was setup for salt-$fname"
         fi
     done
 }
@@ -2352,7 +2620,7 @@ install_debian_6_deps() {
     fi
 
     # shellcheck disable=SC2086
-    wget $_WGET_ARGS -q http://debian.saltstack.com/debian-salt-team-joehealy.gpg.key -O - | apt-key add - || return 1
+    __fetch_verify http://debian.saltstack.com/debian-salt-team-joehealy.gpg.key 267d1f152d0cc94b23eb4c6993ba3d67 3100 | apt-key add - || return 1
 
     if [ "$_PIP_ALLOWED" -eq $BS_TRUE ]; then
         echowarn "PyZMQ will be installed from PyPI in order to compile it against ZMQ3"
@@ -2384,29 +2652,33 @@ _eof
         __apt_get_install_noinput -t unstable libzmq3 libzmq3-dev || return 1
         __apt_get_install_noinput build-essential python-dev python-pip python-setuptools || return 1
 
-        # Saltstack's Unstable Debian repository
-        if [ "$(grep -R 'debian.saltstack.com' /etc/apt)" = "" ]; then
-            echo "deb http://debian.saltstack.com/debian unstable main" >> \
-                /etc/apt/sources.list.d/saltstack.list
+        if [ $_DISABLE_REPOS -eq $BS_FALSE ]; then
+            # Saltstack's Unstable Debian repository
+            if [ "$(grep -R 'debian.saltstack.com' /etc/apt)" = "" ]; then
+                echo "deb http://debian.saltstack.com/debian unstable main" >> \
+                    /etc/apt/sources.list.d/saltstack.list
+            fi
         fi
         return 0
     fi
 
-    # Debian Backports
-    if [ "$(grep -R 'squeeze-backports' /etc/apt | grep -v "^#")" = "" ]; then
-        echo "deb http://ftp.de.debian.org/debian-backports squeeze-backports main" >> \
-            /etc/apt/sources.list.d/backports.list
-    fi
+    if [ $_DISABLE_REPOS -eq $BS_FALSE ]; then
+        # Debian Backports
+        if [ "$(grep -R 'squeeze-backports' /etc/apt | grep -v "^#")" = "" ]; then
+            echo "deb http://ftp.de.debian.org/debian-backports squeeze-backports main" >> \
+                /etc/apt/sources.list.d/backports.list
+        fi
 
-    # Saltstack's Stable Debian repository
-    if [ "$(grep -R 'squeeze-saltstack' /etc/apt)" = "" ]; then
-        echo "deb http://debian.saltstack.com/debian squeeze-saltstack main" >> \
-            /etc/apt/sources.list.d/saltstack.list
+        # Saltstack's Stable Debian repository
+        if [ "$(grep -R 'squeeze-saltstack' /etc/apt)" = "" ]; then
+            echo "deb http://debian.saltstack.com/debian squeeze-saltstack main" >> \
+                /etc/apt/sources.list.d/saltstack.list
+        fi
+        apt-get update || return 1
     fi
-    apt-get update || return 1
 
     # Python requests is available through Squeeze backports
-    # Additionally install procps and pciutils which allows for Docker boostraps. See 366#issuecomment-39666813
+    # Additionally install procps and pciutils which allows for Docker bootstraps. See 366#issuecomment-39666813
     __apt_get_install_noinput python-pip procps pciutils python-requests
 
     # Need python-apt for managing packages via Salt
@@ -2461,20 +2733,22 @@ install_debian_7_deps() {
         apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 8B48AD6246925553 || return 1
     fi
 
-    # Debian Backports
-    if [ "$(grep -R 'wheezy-backports' /etc/apt | grep -v "^#")" = "" ]; then
-        echo "deb http://httpredir.debian.org/debian wheezy-backports main" >> \
-            /etc/apt/sources.list.d/backports.list
-    fi
+    if [ $_DISABLE_REPOS -eq $BS_FALSE ]; then
+        # Debian Backports
+        if [ "$(grep -R 'wheezy-backports' /etc/apt | grep -v "^#")" = "" ]; then
+            echo "deb http://httpredir.debian.org/debian wheezy-backports main" >> \
+                /etc/apt/sources.list.d/backports.list
+        fi
 
-    # Saltstack's Stable Debian repository
-    if [ "$(grep -R 'wheezy-saltstack' /etc/apt)" = "" ]; then
-        echo "deb http://debian.saltstack.com/debian wheezy-saltstack main" >> \
-            /etc/apt/sources.list.d/saltstack.list
+        # Saltstack's Stable Debian repository
+        if [ "$(grep -R 'wheezy-saltstack' /etc/apt)" = "" ]; then
+            echo "deb http://debian.saltstack.com/debian wheezy-saltstack main" >> \
+                /etc/apt/sources.list.d/saltstack.list
+        fi
     fi
 
     # shellcheck disable=SC2086
-    wget $_WGET_ARGS -q http://debian.saltstack.com/debian-salt-team-joehealy.gpg.key -O - | apt-key add - || return 1
+    __fetch_verify http://debian.saltstack.com/debian-salt-team-joehealy.gpg.key 267d1f152d0cc94b23eb4c6993ba3d67 3100 | apt-key add - || return 1
 
     apt-get update || return 1
     __apt_get_install_noinput -t wheezy-backports libzmq3 libzmq3-dev python-zmq python-apt || return 1
@@ -2510,6 +2784,15 @@ install_debian_7_deps() {
 install_debian_8_deps() {
     echodebug "install_debian_8_deps"
 
+    if [ $_DISABLE_REPOS -eq $BS_FALSE ]; then
+        if [ "$CPU_ARCH_L" = "amd64" ] || [ "$CPU_ARCH_L" = "x86_64" ]; then
+            repo_arch="amd64"
+        elif [ "$CPU_ARCH_L" = "i386" ] || [ "$CPU_ARCH_L" = "i686" ]; then
+            echoerror "repo.saltstack.com likely doesn't have 32-bit packages for Debian (yet?)"
+            repo_arch="i386"
+        fi
+    fi
+
     if [ $_START_DAEMONS -eq $BS_FALSE ]; then
         echowarn "Not starting daemons on Debian based distributions is not working mostly because starting them is the default behaviour."
     fi
@@ -2529,14 +2812,20 @@ install_debian_8_deps() {
         apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 7638D0442B90D010 || return 1
     fi
 
-    # Saltstack's Stable Debian repository
-    if [ "$(grep -R 'latest jessie main' /etc/apt)" = "" ]; then
-        echo "deb http://repo.saltstack.com/apt/debian/latest jessie main" >> \
-            /etc/apt/sources.list.d/saltstack.list
-    fi
+    if [ $_DISABLE_REPOS -eq $BS_FALSE ]; then
+        # Versions starting with 2015.5.6 and 2015.8.1 are hosted at repo.saltstack.com
+        if [ "$(echo "$STABLE_REV" | egrep '^(2015\.5|2015\.8|latest|archive\/)')" != "" ]; then
+            SALTSTACK_DEBIAN_URL="${HTTP_VAL}://repo.saltstack.com/apt/debian/$DISTRO_MAJOR_VERSION/$repo_arch/$STABLE_REV"
+            echo "deb $SALTSTACK_DEBIAN_URL jessie main" > "/etc/apt/sources.list.d/saltstack.list"
 
-    # shellcheck disable=SC2086
-    wget $_WGET_ARGS -q https://repo.saltstack.com/apt/debian/latest/SALTSTACK-GPG-KEY.pub -O - | apt-key add - || return 1
+            # shellcheck disable=SC2086
+            wget $_WGET_ARGS -q "$SALTSTACK_DEBIAN_URL/SALTSTACK-GPG-KEY.pub" -O - | apt-key add - || return 1
+
+            if [ "${HTTP_VAL}" = "https" ] ; then
+                __apt_get_install_noinput apt-transport-https || return 1
+            fi
+        fi
+    fi
 
     apt-get update || return 1
     __PACKAGES="libzmq3 libzmq3-dev python-zmq python-requests python-apt"
@@ -2738,7 +3027,7 @@ install_debian_8_stable() {
 
 install_debian_git() {
     if [ -f "${_SALT_GIT_CHECKOUT_DIR}/salt/syspaths.py" ]; then
-      python setup.py --salt-config-dir="$_SALT_ETC_DIR" install --install-layout=deb || return 1
+      python setup.py --salt-config-dir="$_SALT_ETC_DIR" --salt-cache-dir="${_SALT_CACHE_DIR}" install --install-layout=deb || return 1
     else
         python setup.py install --install-layout=deb || return 1
     fi
@@ -2783,7 +3072,7 @@ install_debian_git_post() {
             if [ -f "${_SALT_GIT_CHECKOUT_DIR}/debian/salt-$fname.init" ]; then
                 __copyfile "${_SALT_GIT_CHECKOUT_DIR}/debian/salt-$fname.init" "/etc/init.d/salt-$fname"
             else
-                __fetch_url "/etc/init.d/salt-$fname" "http://anonscm.debian.org/cgit/pkg-salt/salt.git/plain/debian/salt-${fname}.init"
+                __fetch_url "/etc/init.d/salt-$fname" "${HTTP_VAL}://anonscm.debian.org/cgit/pkg-salt/salt.git/plain/debian/salt-${fname}.init"
             fi
             if [ ! -f "/etc/init.d/salt-$fname" ]; then
                 echowarn "The init script for salt-$fname was not found, skipping it..."
@@ -2862,11 +3151,14 @@ __fedora_get_package_manager() {
 
 install_fedora_deps() {
     __fedora_get_package_manager
-    if [ "$_ENABLE_EXTERNAL_ZMQ_REPOS" -eq $BS_TRUE ]; then
-        __install_saltstack_copr_zeromq_repository || return 1
-    fi
 
-    __install_saltstack_copr_salt_repository || return 1
+    if [ $_DISABLE_REPOS -eq $BS_FALSE ]; then
+        if [ "$_ENABLE_EXTERNAL_ZMQ_REPOS" -eq $BS_TRUE ]; then
+            __install_saltstack_copr_zeromq_repository || return 1
+        fi
+
+        __install_saltstack_copr_salt_repository || return 1
+    fi
 
     __PACKAGES="yum-utils PyYAML libyaml m2crypto python-crypto python-jinja2 python-msgpack python-zmq python-requests"
 
@@ -2960,7 +3252,7 @@ install_fedora_git_deps() {
 
 install_fedora_git() {
     if [ -f "${_SALT_GIT_CHECKOUT_DIR}/salt/syspaths.py" ]; then
-        python setup.py --salt-config-dir="$_SALT_ETC_DIR" install || return 1
+        python setup.py --salt-config-dir="$_SALT_ETC_DIR" --salt-cache-dir="${_SALT_CACHE_DIR}" install || return 1
     else
         python setup.py install || return 1
     fi
@@ -3057,12 +3349,12 @@ __install_epel_repository() {
         rpm -q curl > /dev/null 2>&1 || yum -y install curl
         # rpm from CentOS/RHEL release 5 does not support HTTP downloads
         # properly, especially 3XX code redirects
-        __fetch_url /tmp/epel-release.rpm "http://download.fedoraproject.org/pub/epel/5/${EPEL_ARCH}/epel-release-5-4.noarch.rpm" || return 1
+        __fetch_url /tmp/epel-release.rpm "${HTTP_VAL}://download.fedoraproject.org/pub/epel/5/${EPEL_ARCH}/epel-release-5-4.noarch.rpm" || return 1
         rpm -Uvh --force /tmp/epel-release.rpm || return 1
     elif [ "$DISTRO_MAJOR_VERSION" -eq 6 ]; then
-        rpm -Uvh --force "http://download.fedoraproject.org/pub/epel/6/${EPEL_ARCH}/epel-release-6-8.noarch.rpm" || return 1
+        rpm -Uvh --force "${HTTP_VAL}://download.fedoraproject.org/pub/epel/6/${EPEL_ARCH}/epel-release-6-8.noarch.rpm" || return 1
     elif [ "$DISTRO_MAJOR_VERSION" -eq 7 ]; then
-        rpm -Uvh --force "http://download.fedoraproject.org/pub/epel/7/${EPEL_ARCH}/e/epel-release-7-5.noarch.rpm" || return 1
+        rpm -Uvh --force "${HTTP_VAL}://download.fedoraproject.org/pub/epel/7/${EPEL_ARCH}/e/epel-release-7-6.noarch.rpm" || return 1
     else
         echoerror "Failed add EPEL repository support."
         return 1
@@ -3080,7 +3372,7 @@ __install_saltstack_copr_zeromq_repository() {
             __REPOTYPE="epel"
         fi
         __fetch_url /etc/yum.repos.d/saltstack-zeromq4.repo \
-            "https://copr.fedorainfracloud.org/coprs/saltstack/zeromq4/repo/${__REPOTYPE}-${DISTRO_MAJOR_VERSION}/saltstack-zeromq4-${__REPOTYPE}-${DISTRO_MAJOR_VERSION}.repo" || return 1
+            "${HTTP_VAL}://copr.fedorainfracloud.org/coprs/saltstack/zeromq4/repo/${__REPOTYPE}-${DISTRO_MAJOR_VERSION}/saltstack-zeromq4-${__REPOTYPE}-${DISTRO_MAJOR_VERSION}.repo" || return 1
     fi
     return 0
 }
@@ -3092,8 +3384,8 @@ __install_saltstack_rhel_repository() {
         repo_rev="latest"
     fi
 
-    base_url="https://repo.saltstack.com/yum/redhat/\$releasever/\$basearch/${repo_rev}/"
-    fetch_url="https://repo.saltstack.com/yum/redhat/${DISTRO_MAJOR_VERSION}/${CPU_ARCH_L}/${repo_rev}/"
+    base_url="${HTTP_VAL}://repo.saltstack.com/yum/redhat/\$releasever/\$basearch/${repo_rev}/"
+    fetch_url="${HTTP_VAL}://repo.saltstack.com/yum/redhat/${DISTRO_MAJOR_VERSION}/${CPU_ARCH_L}/${repo_rev}/"
 
     if [ "${DISTRO_MAJOR_VERSION}" -eq 5 ]; then
         gpg_key="SALTSTACK-EL5-GPG-KEY.pub"
@@ -3101,10 +3393,10 @@ __install_saltstack_rhel_repository() {
         gpg_key="SALTSTACK-GPG-KEY.pub"
     fi
 
-    repo_file="/etc/yum.repos.d/salt-${repo_rev}.repo"
+    repo_file="/etc/yum.repos.d/saltstack.repo"
     if [ ! -s "$repo_file" ]; then
         cat <<_eof > "$repo_file"
-[salt-${repo_rev}]
+[saltstack]
 name=SaltStack ${repo_rev} Release Channel for RHEL/CentOS \$releasever
 baseurl=$base_url
 skip_if_unavailable=True
@@ -3121,7 +3413,7 @@ _eof
         # Import CentOS 7 GPG key on RHEL for installing base dependencies from
         # Salt corporate repository
         rpm -qa gpg-pubkey\* --qf "%{name}-%{version}\n" | grep -q ^gpg-pubkey-f4a80eb5$ || \
-            __rpm_import_gpg "https://repo.saltstack.com/yum/redhat/7/x86_64/${repo_rev}/base/RPM-GPG-KEY-CentOS-7" || return 1
+            __rpm_import_gpg "${HTTP_VAL}://repo.saltstack.com/yum/redhat/7/x86_64/${repo_rev}/base/RPM-GPG-KEY-CentOS-7" || return 1
     fi
 
     return 0
@@ -3141,14 +3433,17 @@ __install_saltstack_copr_salt_repository() {
 
     if [ ! -s "/etc/yum.repos.d/${__REPO_FILENAME}" ]; then
         __fetch_url "/etc/yum.repos.d/${__REPO_FILENAME}" \
-            "https://copr.fedorainfracloud.org/coprs/saltstack/salt/repo/${__REPOTYPE}-${DISTRO_MAJOR_VERSION}/${__REPO_FILENAME}" || return 1
+            "${HTTP_VAL}://copr.fedorainfracloud.org/coprs/saltstack/salt/repo/${__REPOTYPE}-${DISTRO_MAJOR_VERSION}/${__REPO_FILENAME}" || return 1
     fi
     return 0
 }
 
 install_centos_stable_deps() {
-    __install_epel_repository || return 1
-    __install_saltstack_rhel_repository || return 1
+
+    if [ $_DISABLE_REPOS -eq $BS_FALSE ]; then
+        __install_epel_repository || return 1
+        __install_saltstack_rhel_repository || return 1
+    fi
 
     if [ -f "${_SALT_GIT_CHECKOUT_DIR}/requirements/base.txt" ]; then
         # We're on the develop branch, install whichever tornado is on the requirements file
@@ -3321,7 +3616,7 @@ install_centos_git() {
         _PYEXE=python2
     fi
     if [ -f "${_SALT_GIT_CHECKOUT_DIR}/salt/syspaths.py" ]; then
-        $_PYEXE setup.py --salt-config-dir="$_SALT_ETC_DIR" install --prefix=/usr || return 1
+        $_PYEXE setup.py --salt-config-dir="$_SALT_ETC_DIR" --salt-cache-dir="${_SALT_CACHE_DIR}" install --prefix=/usr || return 1
     else
         $_PYEXE setup.py install --prefix=/usr || return 1
     fi
@@ -3790,28 +4085,31 @@ install_amazon_linux_ami_2010_git_deps() {
 }
 
 install_amazon_linux_ami_deps() {
-    # enable the EPEL repo
-    /usr/bin/yum-config-manager --enable epel || return 1
 
-    # exclude Salt and ZeroMQ packages from EPEL
-    /usr/bin/yum-config-manager epel --setopt "epel.exclude=zeromq* salt* python-zmq*" --save || return 1
+    if [ $_DISABLE_REPOS -eq $BS_FALSE ]; then
+        # enable the EPEL repo
+        /usr/bin/yum-config-manager --enable epel || return 1
 
-    __REPO_FILENAME="saltstack-repo.repo"
+        # exclude Salt and ZeroMQ packages from EPEL
+        /usr/bin/yum-config-manager epel --setopt "epel.exclude=zeromq* salt* python-zmq*" --save || return 1
 
-    if [ ! -s "/etc/yum.repos.d/${__REPO_FILENAME}" ]; then
-      cat <<_eof > "/etc/yum.repos.d/${__REPO_FILENAME}"
+        __REPO_FILENAME="saltstack-repo.repo"
+
+        if [ ! -s "/etc/yum.repos.d/${__REPO_FILENAME}" ]; then
+          cat <<_eof > "/etc/yum.repos.d/${__REPO_FILENAME}"
 [saltstack-repo]
 disabled=False
 name=SaltStack repo for RHEL/CentOS 6
 gpgcheck=1
-gpgkey=https://repo.saltstack.com/yum/redhat/6/\$basearch/$STABLE_REV/SALTSTACK-GPG-KEY.pub
-baseurl=https://repo.saltstack.com/yum/redhat/6/\$basearch/$STABLE_REV/
+gpgkey=$HTTP_VAL://repo.saltstack.com/yum/redhat/6/\$basearch/$STABLE_REV/SALTSTACK-GPG-KEY.pub
+baseurl=$HTTP_VAL://repo.saltstack.com/yum/redhat/6/\$basearch/$STABLE_REV/
 humanname=SaltStack repo for RHEL/CentOS 6
 _eof
-    fi
+        fi
 
-    if [ "$_UPGRADE_SYS" -eq $BS_TRUE ]; then
-        yum -y update || return 1
+        if [ "$_UPGRADE_SYS" -eq $BS_TRUE ]; then
+            yum -y update || return 1
+        fi
     fi
 
     __PACKAGES="PyYAML m2crypto python-crypto python-msgpack python-zmq python26-ordereddict python-jinja2 python-requests"
@@ -3978,7 +4276,7 @@ install_arch_linux_stable() {
 
 install_arch_linux_git() {
     if [ -f "${_SALT_GIT_CHECKOUT_DIR}/salt/syspaths.py" ]; then
-        python2 setup.py --salt-config-dir="$_SALT_ETC_DIR" install || return 1
+        python2 setup.py --salt-config-dir="$_SALT_ETC_DIR" --salt-cache-dir="${_SALT_CACHE_DIR}" install || return 1
     else
         python2 setup.py install || return 1
     fi
@@ -4101,6 +4399,11 @@ install_arch_check_services() {
 #
 #   FreeBSD Install Functions
 #
+config_freebsd_salt() {
+    _SALT_ETC_DIR=${BS_SALT_ETC_DIR:-/usr/local/etc/salt}
+    config_salt
+}
+
 __freebsd_get_packagesite() {
     if [ "$CPU_ARCH_L" = "amd64" ]; then
         BSD_ARCH="x86:64"
@@ -4168,20 +4471,23 @@ __configure_freebsd_pkg_details() {
 }
 
 install_freebsd_9_stable_deps() {
-    #make variables available even if pkg already installed
-    __freebsd_get_packagesite
 
-    if [ ! -x /usr/local/sbin/pkg ]; then
+    if [ $_DISABLE_REPOS -eq $BS_FALSE ]; then
+        #make variables available even if pkg already installed
+        __freebsd_get_packagesite
 
-        # install new `pkg` code from its own tarball.
-        fetch "${_PACKAGESITE}/Latest/pkg.txz" || return 1
-        tar xf ./pkg.txz -s ",/.*/,,g" "*/pkg-static" || return 1
-        ./pkg-static add ./pkg.txz || return 1
-        /usr/local/sbin/pkg2ng || return 1
+        if [ ! -x /usr/local/sbin/pkg ]; then
+
+            # install new `pkg` code from its own tarball.
+            fetch "${_PACKAGESITE}/Latest/pkg.txz" || return 1
+            tar xf ./pkg.txz -s ",/.*/,,g" "*/pkg-static" || return 1
+            ./pkg-static add ./pkg.txz || return 1
+            /usr/local/sbin/pkg2ng || return 1
+        fi
+
+        # Configure the pkg repository using new approach
+        __configure_freebsd_pkg_details || return 1
     fi
-
-    # Configure the pkg repository using new approach
-    __configure_freebsd_pkg_details || return 1
 
     # Now install swig
     # shellcheck disable=SC2086
@@ -4315,7 +4621,7 @@ install_freebsd_git() {
         /usr/local/bin/python2 setup.py \
             --salt-root-dir=/usr/local \
             --salt-config-dir="${_SALT_ETC_DIR}" \
-            --salt-cache-dir=/var/cache/salt \
+            --salt-cache-dir="${_SALT_CACHE_DIR}" \
             --salt-sock-dir=/var/run/salt \
             --salt-srv-root-dir=/srv \
             --salt-base-file-roots-dir="${_SALT_ETC_DIR}/states" \
@@ -4351,8 +4657,6 @@ install_freebsd_9_stable_post() {
         enable_string="salt_${fname}_enable=\"YES\""
         grep "$enable_string" /etc/rc.conf >/dev/null 2>&1
         [ $? -eq 1 ] && echo "$enable_string" >> /etc/rc.conf
-
-        [ -f "${_SALT_ETC_DIR}/${fname}.sample" ] && __copyfile "${_SALT_ETC_DIR}/${fname}.sample" "${_SALT_ETC_DIR}/${fname}"
 
         if [ $fname = "minion" ] ; then
             grep "salt_minion_paths" /etc/rc.conf >/dev/null 2>&1
@@ -4403,6 +4707,7 @@ install_freebsd_restart_daemons() {
 #
 
 __choose_openbsd_mirror() {
+    # FIXME: cleartext download over unsecure protocol (HTTP)
     MIRRORS_LIST_URL=http://www.openbsd.org/ftp.html
     MIRROR_LIST_FILE=/tmp/openbsd-mirrors.html
     OPENBSD_REPO=''
@@ -4540,7 +4845,7 @@ install_openbsd_post() {
         # Skip if not meant to be installed
         [ $fname = "minion" ] && [ "$_INSTALL_MINION" -eq $BS_FALSE ] && continue
         [ $fname = "master" ] && [ "$_INSTALL_MASTER" -eq $BS_FALSE ] && continue
-        [ $fname = "api" ] || [ "$(which salt-${fname} 2>/dev/null)" = "" ] && continue
+        [ $fname = "api" ] || ! __check_command_exists "salt-${fname}" && continue
         [ $fname = "syndic" ] && continue
 
         if [ $? -eq 1 ]; then
@@ -4644,8 +4949,7 @@ install_smartos_deps() {
 install_smartos_git_deps() {
     install_smartos_deps || return 1
 
-    which git > /dev/null 2>&1
-    if [ $? -eq 1 ]; then
+    if ! __check_command_exists git; then
         pkgin -y install git || return 1
     fi
 
@@ -4679,7 +4983,7 @@ install_smartos_stable() {
 install_smartos_git() {
     # Use setuptools in order to also install dependencies
     # lets force our config path on the setup for now, since salt/syspaths.py only  got fixed in 2015.5.0
-    USE_SETUPTOOLS=1 /opt/local/bin/python setup.py --salt-config-dir="$_SALT_ETC_DIR" install || return 1
+    USE_SETUPTOOLS=1 /opt/local/bin/python setup.py --salt-config-dir="$_SALT_ETC_DIR" --salt-cache-dir="${_SALT_CACHE_DIR}" install || return 1
     return 0
 }
 
@@ -4809,12 +5113,14 @@ install_opensuse_stable_deps() {
         DISTRO_REPO="openSUSE_${DISTRO_MAJOR_VERSION}.${DISTRO_MINOR_VERSION}"
     fi
 
-    # Is the repository already known
-    opensuse_deps_repo_url="http://download.opensuse.org/repositories/systemsmanagement:saltstack/${DISTRO_REPO}/systemsmanagement:saltstack.repo"
-    __zypper repos --details | grep "${opensuse_deps_repo_url}" >/dev/null 2>&1
-    if [ $? -eq 1 ]; then
-        # zypper does not yet know nothing about systemsmanagement_saltstack
-        __zypper addrepo --refresh "${opensuse_deps_repo_url}" systemsmanagement_saltstack || return 1
+    if [ $_DISABLE_REPOS -eq $BS_FALSE ]; then
+        # Is the repository already known
+        __set_suse_pkg_repo
+        __zypper repos --details | grep "${SUSE_PKG_URL}" >/dev/null 2>&1
+        if [ $? -eq 1 ]; then
+            # zypper does not yet know anything about systemsmanagement_saltstack
+            __zypper addrepo --refresh "${SUSE_PKG_URL}" || return 1
+        fi
     fi
 
     __zypper --gpg-auto-import-keys refresh
@@ -5039,12 +5345,14 @@ install_suse_12_stable_deps() {
 
     DISTRO_REPO="SLE_${DISTRO_MAJOR_VERSION}"
 
-    # Is the repository already known
-    __zypper repos | grep systemsmanagement_saltstack >/dev/null 2>&1
-    if [ $? -eq 1 ]; then
-        # zypper does not yet know nothing about systemsmanagement_saltstack
-        __zypper addrepo --refresh \
-            "http://download.opensuse.org/repositories/systemsmanagement:saltstack/${DISTRO_REPO}/systemsmanagement:saltstack.repo" || return 1
+    if [ $_DISABLE_REPOS -eq $BS_FALSE ]; then
+        # Is the repository already known
+        __set_suse_pkg_repo
+        __zypper repos | grep "${SUSE_PKG_URL}" >/dev/null 2>&1
+        if [ $? -eq 1 ]; then
+            # zypper does not yet know nothing about systemsmanagement_saltstack
+            __zypper addrepo --refresh "${SUSE_PKG_URL}" || return 1
+        fi
     fi
 
     __zypper --gpg-auto-import-keys refresh || return 1
@@ -5095,7 +5403,7 @@ install_suse_12_stable_deps() {
                 # Skip if not meant to be installed
                 [ $fname = "minion" ] && [ "$_INSTALL_MINION" -eq $BS_FALSE ] && continue
                 [ $fname = "master" ] && [ "$_INSTALL_MASTER" -eq $BS_FALSE ] && continue
-                [ $fname = "api" ] && ([ "$_INSTALL_MASTER" -eq $BS_FALSE ] || [ "$(which salt-${fname} 2>/dev/null)" = "" ]) && continue
+                [ $fname = "api" ] && ([ "$_INSTALL_MASTER" -eq $BS_FALSE ] || ! __check_command_exists "salt-${fname}") && continue
                 [ $fname = "syndic" ] && [ "$_INSTALL_SYNDIC" -eq $BS_FALSE ] && continue
 
                 # Syndic uses the same configuration file as the master
@@ -5123,7 +5431,7 @@ install_suse_12_stable_deps() {
 install_suse_12_git_deps() {
     install_suse_11_stable_deps || return 1
 
-    if [ "$(which git)" = "" ]; then
+    if ! __check_command_exists git; then
         __zypper_install git  || return 1
     fi
 
@@ -5171,7 +5479,7 @@ install_suse_12_stable_post() {
             # Skip if not meant to be installed
             [ $fname = "minion" ] && [ "$_INSTALL_MINION" -eq $BS_FALSE ] && continue
             [ $fname = "master" ] && [ "$_INSTALL_MASTER" -eq $BS_FALSE ] && continue
-            [ $fname = "api" ] && ([ "$_INSTALL_MASTER" -eq $BS_FALSE ] || [ "$(which salt-${fname} 2>/dev/null)" = "" ]) && continue
+            [ $fname = "api" ] && ([ "$_INSTALL_MASTER" -eq $BS_FALSE ] || ! __check_command_exists "salt-${fname}") && continue
             [ $fname = "syndic" ] && [ "$_INSTALL_SYNDIC" -eq $BS_FALSE ] && continue
 
             if [ -f /bin/systemctl ]; then
@@ -5225,12 +5533,14 @@ install_suse_11_stable_deps() {
     fi
     DISTRO_REPO="SLE_${DISTRO_MAJOR_VERSION}${DISTRO_PATCHLEVEL}"
 
-    # Is the repository already known
-    __zypper repos | grep systemsmanagement_saltstack >/dev/null 2>&1
-    if [ $? -eq 1 ]; then
-        # zypper does not yet know nothing about systemsmanagement_saltstack
-        __zypper addrepo --refresh \
-            "http://download.opensuse.org/repositories/systemsmanagement:saltstack/${DISTRO_REPO}/systemsmanagement:saltstack.repo" || return 1
+    if [ $_DISABLE_REPOS -eq $BS_FALSE ]; then
+        # Is the repository already known
+        __set_suse_pkg_repo
+        __zypper repos | grep "${SUSE_PKG_URL}" >/dev/null 2>&1
+        if [ $? -eq 1 ]; then
+            # zypper does not yet know nothing about systemsmanagement_saltstack
+            __zypper addrepo --refresh "${SUSE_PKG_URL}" || return 1
+        fi
     fi
 
     __zypper --gpg-auto-import-keys refresh || return 1
@@ -5962,9 +6272,9 @@ fi
 # Ensure that the cachedir exists
 # (Workaround for https://github.com/saltstack/salt/issues/6502)
 if [ "$_INSTALL_MINION" -eq $BS_TRUE ]; then
-    if [ ! -d /var/cache/salt/minion/proc ]; then
+    if [ ! -d "${_SALT_CACHE_DIR}/minion/proc" ]; then
         echodebug "Creating salt's cachedir"
-        mkdir -p /var/cache/salt/minion/proc
+        mkdir -p "${_SALT_CACHE_DIR}/minion/proc"
     fi
 fi
 
